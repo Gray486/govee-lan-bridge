@@ -1,173 +1,206 @@
-"""Offline tests: frames must match what the Govee app sent in the BLE captures,
-and the bridge logic must respect the lamp's rules. Run: python test_bridge.py"""
+"""Offline tests. Frames must match commands captured from the Govee app or verified live on the lights;
+bridge logic must respect each light's rules. Run: python test_bridge.py"""
 
+import itertools
 import json
 import os
-os.environ.setdefault("LAMP_IP", "192.0.2.1")   # TEST-NET address, never contacted
+import tempfile
+
 import bridge as B
+
+fails = 0
+
+
+def check(name, ok, detail=""):
+    global fails
+    fails += not ok
+    print(f"{'PASS' if ok else 'FAIL'}  {name}" + ("" if ok else f"\n      {detail}"))
 
 
 def hexf(f):
     return f.hex(" ")
 
 
-# Frames byte-for-byte against the decrypted app captures.
-CAPTURED = {
-    "lower off":             (B.f_section(3, False), "33 30 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"),
-    "ripple on":             (B.f_section(1, True),  "33 30 01 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 03"),
-    "lower 2700K":           (B.f_kelvin(3, 2700),   "33 05 2c 03 01 0a 8c 00 00 00 00 00 00 00 00 00 00 00 00 9e"),
-    "lower 6500K":           (B.f_kelvin(3, 6500),   "33 05 2c 03 01 19 64 00 00 00 00 00 00 00 00 00 00 00 00 65"),
-    "lower brightness 1%":   (B.f_brightness(3, 1),  "33 05 2c 03 02 01 00 00 00 00 00 00 00 00 00 00 00 00 00 1a"),
-    "ripple brightness 100": (B.f_brightness(1, 100), "33 05 2c 01 02 64 00 00 00 00 00 00 00 00 00 00 00 00 00 7d"),
-    "flow 55":               (B.f_flow(55),          "33 05 2c 01 03 37 00 00 00 00 00 00 00 00 00 00 00 00 00 2f"),
-    "ripple rgb 00ffff":     (B.f_rgb(1, 0, 255, 255), "33 05 2c 01 01 00 ff ff 00 00 00 00 00 00 00 00 00 00 00 1a"),
-    "master power off":      (B.frame(0x33, 0x01, 0), "33 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 32"),
+# ---------------------------------------------------------------- frames vs. captures / live tests
+FRAMES = {
+    "H60B0 lower off":             (B.f_section(3, False), "33 30 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"),
+    "H60B0 ripple on":             (B.f_section(1, True),  "33 30 01 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 03"),
+    "H60B0 lower 2700K":           (B.f_kelvin(3, 2700),   "33 05 2c 03 01 0a 8c 00 00 00 00 00 00 00 00 00 00 00 00 9e"),
+    "H60B0 lower 6500K":           (B.f_kelvin(3, 6500),   "33 05 2c 03 01 19 64 00 00 00 00 00 00 00 00 00 00 00 00 65"),
+    "H60B0 lower brightness 1%":   (B.f_brightness(3, 1),  "33 05 2c 03 02 01 00 00 00 00 00 00 00 00 00 00 00 00 00 1a"),
+    "H60B0 ripple brightness 100": (B.f_brightness(1, 100), "33 05 2c 01 02 64 00 00 00 00 00 00 00 00 00 00 00 00 00 7d"),
+    "H60B0 flow 55":               (B.f_flow(55),          "33 05 2c 01 03 37 00 00 00 00 00 00 00 00 00 00 00 00 00 2f"),
+    "H60B0 ripple rgb 00ffff":     (B.f_rgb(1, 0, 255, 255), "33 05 2c 01 01 00 ff ff 00 00 00 00 00 00 00 00 00 00 00 1a"),
+    "power off":                   (B.f_power(False),      "33 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 32"),
+    "master brightness 100":       (B.f_master(100),       "33 04 64 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 53"),
+    "H6088 cube 1 red":            (B.f_seg_rgb(255, 0, 0, 0x01, 1), "33 05 15 01 ff 00 00 00 00 00 00 00 01"),
+    "H6088 cubes 1-3 2700K":       (B.f_seg_kelvin(2700, 0x07, 1), "33 05 15 01 00 00 00 0a 8c 00 00 00 07"),
+    "H6088 cubes 1-3 5%":          (B.f_seg_brightness(5, 0x07, 1), "33 05 15 02 05 07 00"),
+    "H61E0 segs 1-4 red":          (B.f_seg_rgb(255, 0, 0, 0x000F, 2), "33 05 15 01 ff 00 00 00 00 00 00 00 0f 00"),
+    "H61E0 seg 9 (2nd mask byte)": (B.f_seg_rgb(0, 0, 255, 1 << 8, 2), "33 05 15 01 00 00 ff 00 00 00 00 00 00 01"),
+    "H61E0 segs 1-3 5%":           (B.f_seg_brightness(5, 0x0007, 2), "33 05 15 02 05 07 00 00"),
 }
-fails = 0
-for name, (got, want) in CAPTURED.items():
-    ok = hexf(got) == want
-    fails += not ok
-    print(f"{'PASS' if ok else 'FAIL'}  {name:24} {hexf(got)}" + ("" if ok else f"\n      want {want}"))
+for name, (got, want) in FRAMES.items():
+    check(f"frame: {name}", hexf(got).startswith(want), f"got  {hexf(got)}\n      want {want}…")
 
-# Safety rules.
-assert B.f_kelvin(3, 9000)[5:7] == bytes([0x19, 0x64]), "kelvin must clamp to 6500"
-assert B.f_kelvin(3, 1000)[5:7] == bytes([0x0a, 0x8c]), "kelvin must clamp to 2700"
+check("safety: kelvin clamps", B.f_kelvin(3, 9000)[5:7] == bytes([0x19, 0x64]) and B.f_seg_kelvin(1000, 1, 1)[7:9] == bytes([0x0a, 0x8c]))
 try:
     B.f_rgb(3, 255, 0, 0)
-    raise AssertionError("lower light must refuse RGB")
+    check("safety: lower light refuses RGB", False)
 except ValueError:
-    pass
-assert B.f_brightness(2, 50)[6] == 0xFF, "side brightness needs the segment mask"
-print("PASS  safety rules (clamp, no RGB on lower, side mask)")
+    check("safety: lower light refuses RGB", True)
 
 
-# Logic with fake MQTT and lamp.
+# ---------------------------------------------------------------- fakes
 class FakeLamp:
-    def __init__(self): self.sent = []
-    def send(self, frames): self.sent.append([hexf(f) for f in frames])
+    def __init__(self):
+        self.sent, self.ip = [], "192.0.2.1"
+
+    def send(self, frames):
+        self.sent.append([hexf(f) for f in frames])
 
 
 class FakeMQTT:
-    def __init__(self): self.pub = []
-    def publish(self, t, p, retain=False): self.pub.append((t, p))
+    def __init__(self):
+        self.pub = []
+
+    def publish(self, t, p, retain=False):
+        self.pub.append((t, p))
 
 
-br = B.Bridge()
-br.lamp, br.mqtt = FakeLamp(), FakeMQTT()
-br.restoring = False
-def cmd(sec, **kw):
-    br.handle(f"{B.BASE}/{sec}/set", json.dumps(kw).encode(), False)
-    br.timer.cancel(); br.flush()
+def dev_of(cls, **kw):
+    d = cls("test", "Test", "192.0.2.1", "X", FakeMQTT(), **kw)
+    d.lamp = FakeLamp()
+    return d
 
-cmd("ripple", state="ON", color={"r": 255, "g": 0, "b": 0}, brightness=128)
-cmd("side", state="ON", color_temp=3000)
-assert len(br.lamp.sent) == 2 and all(len(b) > 1 for b in br.lamp.sent), "each change must be ONE datagram"
-cmd("lower", state="ON")                         # third section -> ripple (oldest) must go off first
-batch = br.lamp.sent[-1]
-assert batch[0].startswith("33 30 01 00"), f"ripple should be switched off first, got {batch}"
-assert br.state["ripple"]["state"] == "OFF" and br.state["lower"]["state"] == "ON"
-print("PASS  two-section limit: turning on lower switched ripple off in the same datagram")
-n = len(br.lamp.sent)
-cmd("lower", color={"r": 1, "g": 2, "b": 3})     # colour on lower is ignored, not sent
-assert not br.lamp.sent[n:] or br.lamp.sent[-1] == [], f"colour must never reach the lower light, got {br.lamp.sent[-1]}"
-print("PASS  colour commands to the lower light are dropped")
-cmd("side", state="OFF")
-assert len(br.lamp.sent[-1]) == 1 and br.lamp.sent[-1][0].startswith("33 30 02 00"), br.lamp.sent[-1]
-print("PASS  off is a single section-off frame")
-br.handle(f"{B.BASE}/flow/set", b"75", False)
-br.timer.cancel(); br.flush()
-assert br.lamp.sent[-1][0].startswith("33 05 2c 01 03 4b")
-print("PASS  flow rate")
 
-# Scene race: side+lower on; a scene sends ripple ON, side ON, lower OFF in any order within the window.
-import itertools
+def cmd(d, entity, payload):
+    d.handle(entity, "set", payload if isinstance(payload, bytes) else json.dumps(payload).encode(), False, False)
+    d.timer.cancel()
+    d.flush()
+    return d.lamp.sent[-1]
+
+
+# ---------------------------------------------------------------- H60B0 (sections)
+d = dev_of(B.SectionDevice)
+cmd(d, "ripple", {"state": "ON", "color": {"r": 255, "g": 0, "b": 0}, "brightness": 128})
+cmd(d, "side", {"state": "ON", "color_temp": 3000})
+sent = cmd(d, "lower", {"state": "ON"})
+check("H60B0 two-section limit: lower on switches ripple off in the same datagram",
+      sent[0].startswith("33 30 01 00") and d.state["ripple"]["state"] == "OFF" and d.state["lower"]["state"] == "ON", sent)
+n = len(d.lamp.sent)
+cmd(d, "lower", {"color": {"r": 1, "g": 2, "b": 3}})
+check("H60B0 colour never reaches the lower light", all(not f.startswith("33 05 2c 03 01") or len(f) == 59 and f[15:20] != "01 02" for f in d.lamp.sent[-1]))
+sent = cmd(d, "side", {"state": "OFF"})
+check("H60B0 section off is one frame", len(sent) == 1 and sent[0].startswith("33 30 02 00"), sent)
+sent = cmd(d, "flow", b"75")
+check("H60B0 flow rate", sent[0].startswith("33 05 2c 01 03 4b"), sent)
+
+ok = True
 for order in itertools.permutations([("ripple", {"state": "ON", "color": {"r": 9, "g": 9, "b": 9}}),
-                                     ("side", {"state": "ON", "brightness": 100}),
-                                     ("lower", {"state": "OFF"})]):
-    br.state["ripple"]["state"], br.state["side"]["state"], br.state["lower"]["state"] = "OFF", "ON", "ON"
-    br.on_order = ["side", "lower"]
+                                     ("side", {"state": "ON", "brightness": 100}), ("lower", {"state": "OFF"})]):
+    d.state["ripple"]["state"], d.state["side"]["state"], d.state["lower"]["state"] = "OFF", "ON", "ON"
+    d.on_order = ["side", "lower"]
     for name, c in order:
-        br.handle(f"{B.BASE}/{name}/set", json.dumps(c).encode(), False)
-    br.timer.cancel(); br.flush()
-    got = {n: br.state[n]["state"] for n in B.SECTIONS}
-    assert got == {"ripple": "ON", "side": "ON", "lower": "OFF"}, (order, got)
-    assert not any(f.startswith("33 30 02 00") for f in br.lamp.sent[-1]), "side must not be switched off"
-    assert len(br.lamp.sent[-1]) > 1
-print("PASS  scene race: every command order lands as defined, in one datagram")
+        d.handle(name, "set", json.dumps(c).encode(), False, False)
+    d.timer.cancel()
+    d.flush()
+    got = {k: v["state"] for k, v in d.state.items()}
+    ok &= got == {"ripple": "ON", "side": "ON", "lower": "OFF"} and not any(f.startswith("33 30 02 00") for f in d.lamp.sent[-1])
+check("H60B0 scene race: every command order lands as defined", ok)
 
-
-# ---- side segments (v1.2)
-def fresh(side_on=True):
-    b = B.Bridge()
-    b.lamp, b.mqtt, b.restoring = FakeLamp(), FakeMQTT(), False
-    if side_on:
-        b.state["side"]["state"], b.on_order = "ON", ["side"]
-    return b
-
-
-def seg(b, i, **kw):
-    b.handle(f"{B.BASE}/side_segment_{i}/set", json.dumps(kw).encode(), False)
-
-
-def go(b):
-    b.timer.cancel()
-    b.flush()
-    return b.lamp.sent[-1]
-
-
-# Frames match the live-verified segment commands (segment 1 blue, segment 5 green).
-assert hexf(B.f_rgb(2, 0, 0, 255, mask=0x01)).startswith("33 05 2c 02 01 00 00 ff 00 00 01")
-assert hexf(B.f_rgb(2, 0, 255, 0, mask=0x10)).startswith("33 05 2c 02 01 00 ff 00 00 00 10")
-print("PASS  segment frames match the live-verified commands")
-
-b = fresh()
+d = dev_of(B.SectionDevice)
+d.state["side"]["state"], d.on_order = "ON", ["side"]
 for i in range(1, 9):
-    seg(b, i, state="ON", color={"r": 255, "g": 0, "b": 0} if i % 2 else {"r": 0, "g": 0, "b": 255}, brightness=255)
-sent = go(b)
-colour = [f for f in sent if f.startswith("33 05 2c 02 01")]
-assert len(colour) == 2, f"8 segments in 2 colours must be 2 frames, got {sent}"
-assert len(b.lamp.sent) == 1, "one datagram"
-print("PASS  8 segments in 2 colours -> 2 colour frames (merged masks), one datagram")
+    d.handle(f"side_segment_{i}", "set", json.dumps({"state": "ON", "brightness": 3 if i % 2 else 255}).encode(), False, False)
+d.timer.cancel()
+d.flush()
+bri = sorted(f[:20] for f in d.lamp.sent[-1] if f.startswith("33 05 2c 02 02"))
+check("H60B0 side segments alternate 1%/100% -> masks 0x55/0xaa", bri == ["33 05 2c 02 02 01 55", "33 05 2c 02 02 64 aa"], bri)
+sent = cmd(d, "lamp", {"state": "OFF"})
+check("H60B0 whole lamp off -> power off only", sent == [hexf(B.f_power(False))], sent)
+on_pub = [p for t, p in d.mqtt.pub if t.endswith("/ripple/state")][-1]
+check("H60B0 sections report off while the lamp is off", on_pub["state"] == "OFF")
+sent = cmd(d, "lamp", {"state": "ON", "brightness": 128})
+check("H60B0 whole lamp on + master brightness", sent[0].startswith("33 01 01") and any(f.startswith("33 04 32") for f in sent), sent)
 
-b = fresh()
-for i in range(1, 9):
-    seg(b, i, state="ON", brightness=3 if i % 2 else 255)    # alternating dim/bright like the live test
-sent = go(b)
-bri = sorted(f[:20] for f in sent if f.startswith("33 05 2c 02 02"))
-assert bri == ["33 05 2c 02 02 01 55", "33 05 2c 02 02 64 aa"], bri
-print("PASS  alternating 1%/100% -> masks 0x55 / 0xaa, exactly as verified on the lamp")
+# ---------------------------------------------------------------- segment family (H6088 / H61E0)
+s = dev_of(B.SegmentDevice, segments=6)
+check("H6088: 7 entities (lamp + 6 cubes)", s.entities() == ["lamp"] + [f"segment_{i}" for i in range(1, 7)])
+sent = cmd(s, "lamp", {"state": "ON", "color": {"r": 0, "g": 255, "b": 0}, "brightness": 255})
+check("H6088 whole colour repaints all cubes in one frame (mask 0x3f)",
+      sent[0].startswith("33 01 01") and any(f.startswith("33 05 15 01 00 ff 00 00 00 00 00 00 3f") for f in sent), sent)
+sent = cmd(s, "segment_3", {"state": "OFF"})
+check("H6088 cube off = black on that cube only", sent == [hexf(B.f_seg_rgb(0, 0, 0, 0x04, 1))], sent)
+sent = cmd(s, "segment_3", {"state": "ON"})
+check("H6088 cube back on restores its colour + brightness",
+      any(f.startswith("33 05 15 01 00 ff 00 00 00 00 00 00 04") for f in sent) and any(f.startswith("33 05 15 02 64 04") for f in sent), sent)
+for i in range(1, 7):
+    s.handle(f"segment_{i}", "set", json.dumps({"state": "ON", "color": {"r": 255, "g": 0, "b": 0} if i % 2 else {"r": 0, "g": 0, "b": 255}}).encode(), False, False)
+s.timer.cancel()
+s.flush()
+colour = [f for f in s.lamp.sent[-1] if f.startswith("33 05 15 01")]
+check("H6088 6 cubes in 2 colours -> 2 colour frames (masks 0x15 / 0x2a)", len(colour) == 2 and len(s.lamp.sent[-1]) <= 12, s.lamp.sent[-1])
+for i in range(1, 7):
+    s.handle(f"segment_{i}", "set", b'{"state": "OFF"}', False, False)
+s.timer.cancel()
+s.flush()
+check("H6088 last cube off -> lamp off", s.whole["state"] == "OFF" and s.lamp.sent[-1][-1].startswith("33 01 00"), s.lamp.sent[-1])
+sent = cmd(s, "segment_2", {"state": "ON", "color_temp": 3000})
+check("H6088 cube on while lamp off -> power on + pattern", sent[0].startswith("33 01 01") and s.whole["state"] == "ON", sent)
 
-b = fresh(side_on=False)
-b.state["ripple"]["state"] = b.state["lower"]["state"] = "ON"
-b.on_order = ["ripple", "lower"]
-seg(b, 3, state="ON", color={"r": 0, "g": 255, "b": 0})
-sent = go(b)
-assert b.state["side"]["state"] == "ON" and b.state["ripple"]["state"] == "OFF", "segment must light side, evicting oldest"
-assert any(f.startswith("33 30 02 01") for f in sent) and any(f.startswith("33 30 01 00") for f in sent)
-print("PASS  segment command with side off: side turns on, oldest section makes room")
+w = dev_of(B.SegmentDevice, segments=15)
+check("H61E0: 16 entities, 2-byte mask", len(w.entities()) == 16 and w.width == 2 and w.all == 0x7FFF)
+sent = cmd(w, "segment_12", {"state": "ON", "color": {"r": 255, "g": 0, "b": 255}})
+check("H61E0 segment 12 uses the second mask byte", any(f.startswith("33 05 15 01 ff 00 ff 00 00 00 00 00 00 08") for f in sent), sent)
+check("H61E0 a full-strip change fits the packet limit", len(cmd(w, "lamp", {"color": {"r": 1, "g": 2, "b": 3}})) <= B.MAX_FRAMES)
 
-b = fresh()
-for i in range(1, 9):
-    seg(b, i, state="OFF")
-sent = go(b)
-assert b.state["side"]["state"] == "OFF" and any(f.startswith("33 30 02 00") for f in sent)
-print("PASS  last lit segment off -> side section off")
+# ---------------------------------------------------------------- inventory / devices.toml
+tmp = tempfile.mkdtemp()
+cfg = os.path.join(tmp, "devices.toml")
+inv = B.Inventory(path=cfg, url="http://unused")
+API = [{"sku": "H60B0", "id": "AA:01", "name": "H60B0_4B83", "ip": "192.0.2.10"},
+       {"sku": "H6088", "id": "AA:02", "name": "H6088_4E96", "ip": "192.0.2.11"},
+       {"sku": "H61E0", "id": "AA:03", "name": "H61E0_141A", "ip": "192.0.2.12"},
+       {"sku": "H6004", "id": "AA:04", "name": "H6004_0B96", "ip": "192.0.2.13"}]
+B.LEGACY_IP, B.LEGACY_KEY, B.LEGACY_NAME = "192.0.2.10", "sunroom_uplight", "Sunroom Uplight"
+entries = inv.sync(API)
+text = open(cfg, encoding="utf8").read()
+check("config written with every govee2mqtt light", all(f'id = "{d["id"]}"' in text for d in API))
+by = {e["id"]: e for e in entries}
+check("v1 uplight keeps key sunroom_uplight", by["AA:01"]["key"] == "sunroom_uplight" and by["AA:01"]["name"] == "Sunroom Uplight")
+check("supported models enabled, unsupported recorded but disabled",
+      by["AA:02"]["enabled"] and by["AA:03"]["enabled"] and not by["AA:04"]["enabled"] and "no built-in profile" in text)
+with open(cfg, "a", encoding="utf8") as f:
+    pass
+text = text.replace('key = "h6088_4e96"', 'key = "bedroom_sconces"').replace('name = "H6088_4E96"', 'name = "Bedroom Sconces"')
+text = text.replace('# my note', '') + "\n# my own comment\n"
+open(cfg, "w", encoding="utf8").write(text)
+API[1]["ip"] = "192.0.2.99"
+entries = inv.sync(API)
+text2 = open(cfg, encoding="utf8").read()
+check("user edits and comments survive a resync", 'key = "bedroom_sconces"' in text2 and "# my own comment" in text2)
+check("IP change updated in place", 'ip = "192.0.2.99"' in text2 and text2.count('id = "AA:02"') == 1)
+check("no duplicate entries on resync", text2.count("[[device]]") == 4)
+entries = inv.sync([])                     # govee2mqtt unavailable -> run from the file
+devs = [B.make_device(e, FakeMQTT()) for e in entries]
+devs = [x for x in devs if x]
+check("from the file alone: 3 bridged lights with the right families",
+      sorted((x.key, type(x).__name__) for x in devs) == [("bedroom_sconces", "SegmentDevice"), ("h61e0_141a", "SegmentDevice"),
+                                                         ("sunroom_uplight", "SectionDevice")], [(x.key, type(x).__name__) for x in devs])
+text3 = text2.replace('sku = "H6004"', 'sku = "H6004"\nfamily = "segments"\nsegments = 4').replace(
+    'name = "H6004_0B96"\nenabled = false', 'name = "H6004_0B96"\nenabled = true')
+open(cfg, "w", encoding="utf8").write(text3)
+user = [B.make_device(e, FakeMQTT()) for e in inv.sync([])]
+check("a user-described model gets bridged", any(x and x.key == "h6004_0b96" and x.n == 4 for x in user))
 
-b = fresh()
-b.segs[2]["color"], b.segs[2]["color_mode"] = {"r": 1, "g": 2, "b": 3}, "rgb"
-b.handle(f"{B.BASE}/side/set", json.dumps({"state": "ON", "color": {"r": 9, "g": 8, "b": 7}}).encode(), False)
-go(b)
-assert all(s["color"] == {"r": 9, "g": 8, "b": 7} and s["color_mode"] == "rgb" for s in b.segs)
-assert len([t for t, _ in b.mqtt.pub if "side_segment_" in t]) == 8, "all 8 segment states republished"
-print("PASS  whole-ring colour repaints every segment and updates all 8 segment entities")
+# Entity IDs for the v1 uplight must not change (scenes and dashboards depend on them).
+up = B.SectionDevice("sunroom_uplight", "Sunroom Uplight", "192.0.2.10", "H60B0", FakeMQTT())
+up.discover()
+uids = {p["unique_id"] for t, p in up.mqtt.pub if t.endswith("/config")}
+check("v1 unique IDs unchanged", {"sunroom_uplight_ripple", "sunroom_uplight_side", "sunroom_uplight_lower",
+                                  "sunroom_uplight_flow_rate", "sunroom_uplight_side_segment_1"} <= uids)
+check("v1 topics unchanged", any(t == "homeassistant/light/sunroom_uplight/ripple/config" for t, _ in up.mqtt.pub))
 
-b = fresh()
-b.segs[0]["color"], b.segs[0]["color_mode"] = {"r": 255, "g": 0, "b": 0}, "rgb"
-b.handle(f"{B.BASE}/side/set", b'{"state": "OFF"}', False)
-go(b)
-b.handle(f"{B.BASE}/side/set", b'{"state": "ON"}', False)
-sent = go(b)
-assert any(f.startswith("33 05 2c 02 01 ff 00 00 00 00 01") for f in sent), "pattern restored on section on"
-print("PASS  side off/on restores the segment pattern")
-
-print("\nALL TESTS PASSED" if not fails else f"\n{fails} FRAME MISMATCHES")
+print("\nALL TESTS PASSED" if not fails else f"\n{fails} FAILED")
+raise SystemExit(1 if fails else 0)

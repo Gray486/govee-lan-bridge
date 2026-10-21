@@ -1,17 +1,16 @@
-"""Govee LAN bridge: exposes the Govee H60B0 uplighter floor lamp's three sections to Home Assistant over MQTT.
+"""Govee LAN bridge: per-section and per-segment control of Govee lights from Home Assistant, LAN only.
 
-LAN-only. Commands go to the lamp as Govee LAN `ptReal` frames (UDP 4003); Home Assistant
-talks to this bridge through MQTT discovery. Standard library only, so nothing is
-downloaded at runtime.
+Lights are discovered from govee2mqtt's HTTP API (`/api/devices`) and recorded in a config file
+(`devices.toml`) that the bridge keeps up to date. Each light with a known profile gets Home Assistant
+entities through MQTT discovery; commands go to the light as Govee LAN `ptReal` frames (UDP 4003).
+Standard library only, so nothing is downloaded at runtime.
 
-Entities created in Home Assistant:
-  light.<name>_ripple   top section: on/off, brightness, RGB, colour temperature
-  light.<name>_side     middle ring (all 8 segments): on/off, brightness, RGB, colour temperature
-  light.<name>_side_segment_1..8   each side segment: on/off, brightness, RGB, colour temperature
-  light.<name>_lower    down light: on/off, brightness, colour temperature
-  number.<name>_flow_rate  ripple lens rotation speed 0-100
+Profiles
+  sections  Govee H60B0 Uplighter: whole lamp, Ripple / Side / Lower sections, 8 side segments, flow rate
+  segments  addressable lights using the 33 05 15 command family (H6088 cube sconces, H61E0 light strip):
+            whole lamp plus one light per segment
 
-The lamp cannot report per-section state over LAN, so state is what the bridge last set
+The lights cannot report per-section or per-segment state over LAN, so state is what the bridge last set
 (retained in MQTT so it survives restarts).
 """
 
@@ -19,36 +18,48 @@ import base64
 import json
 import math
 import os
+import re
 import socket
 import struct
 import threading
 import time
+import tomllib
+import urllib.request
 
-LAMP_IP = os.environ.get("LAMP_IP", "")
-LAMP_PORT = 4003
 MQTT_HOST = os.environ.get("MQTT_HOST", "127.0.0.1")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USER = os.environ.get("MQTT_USER") or None
 MQTT_PASS = os.environ.get("MQTT_PASS") or None
-DEVICE_ID = os.environ.get("DEVICE_ID", "govee_h60b0")
-DEVICE_NAME = os.environ.get("DEVICE_NAME", "Govee H60B0")
-BASE = f"govee_lan/{DEVICE_ID}"
 DISCOVERY = os.environ.get("DISCOVERY_PREFIX", "homeassistant")
+GOVEE2MQTT_URL = os.environ.get("GOVEE2MQTT_URL", "http://127.0.0.1:8056").rstrip("/")
+CONFIG_PATH = os.environ.get("CONFIG_PATH", "/config/devices.toml")
+REFRESH = int(os.environ.get("DISCOVERY_INTERVAL", "600"))      # seconds between govee2mqtt refreshes
+# v1 single-lamp settings: still honoured, so an existing H60B0 keeps its entity IDs.
+LEGACY_IP = os.environ.get("LAMP_IP", "")
+LEGACY_KEY = os.environ.get("DEVICE_ID", "")
+LEGACY_NAME = os.environ.get("DEVICE_NAME", "")
 
-MIN_K, MAX_K = 2700, 6500          # outside this range the lamp blacks out
-MIN_GAP = 0.05                     # seconds between UDP datagrams to the lamp
-MAX_FRAMES = int(os.environ.get("MAX_FRAMES_PER_PACKET", "12"))  # larger changes split across packets
-BATCH_WINDOW = float(os.environ.get("BATCH_WINDOW", "0.15"))  # commands this close together form one change
-SECTIONS = {"ripple": 1, "side": 2, "lower": 3}
-SEGMENTS = 8                       # side ring segments; mask bit n = segment n+1
-SEG_OFF_PCT = 1                    # the lamp has no per-segment off; minimum brightness is the closest
+ROOT = "govee_lan"
+STATUS = f"{ROOT}/status"
+LAMP_PORT = 4003
+MIN_K, MAX_K = 2700, 6500          # outside this range the H60B0 blacks out; safe for all profiles
+MIN_GAP = 0.05                     # seconds between UDP datagrams to one light
+MAX_FRAMES = int(os.environ.get("MAX_FRAMES_PER_PACKET", "12"))  # lights drop packets of ~24 frames
+BATCH_WINDOW = float(os.environ.get("BATCH_WINDOW", "0.15"))     # commands this close together form one change
+
+# Known models. Users can add others in devices.toml with `family` (and `segments`).
+PROFILES = {
+    "H60B0": {"family": "sections"},
+    "H6088": {"family": "segments", "segments": 6},
+    "H61E0": {"family": "segments", "segments": 15},
+}
 
 
 def log(msg):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
 
 
-# ---------------------------------------------------------------- lamp protocol
+# ---------------------------------------------------------------- protocol helpers
 
 def frame(*data):
     """20-byte Govee frame: data, zero padding, XOR checksum."""
@@ -81,7 +92,24 @@ def pct(brightness_255):
     return max(1, min(100, round(int(brightness_255) * 100 / 255)))
 
 
+def mask_bytes(mask, width):
+    return tuple((mask >> (8 * i)) & 0xFF for i in range(width))
+
+
+def slug(text):
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_") or "govee"
+
+
+# Shared by every Govee light
 def f_power(on):            return frame(0x33, 0x01, 1 if on else 0)
+def f_master(p):            return frame(0x33, 0x04, p)
+
+# H60B0 "sections" family
+SECTIONS = {"ripple": 1, "side": 2, "lower": 3}
+SIDE_SEGMENTS = 8                  # side ring; mask bit n = segment n+1
+SIDE_OFF_PCT = 1                   # diffuse ring: minimum brightness is as dark as it gets
+
+
 def f_section(sec, on):     return frame(0x33, 0x30, sec, 1 if on else 0)
 def f_flow(v):              return frame(0x33, 0x05, 0x2C, 0x01, 0x03, max(0, min(100, int(v))))
 
@@ -108,11 +136,25 @@ def f_kelvin(sec, k, mask=0xFF):
     return frame(0x33, 0x05, 0x2C, sec, 0x01, r, g, b, k >> 8, k & 0xFF, *extra)
 
 
+# "segments" family (33 05 15): colour/kelvin mask at byte 12, brightness mask right after the value
+def f_seg_rgb(r, g, b, mask, width):
+    return frame(0x33, 0x05, 0x15, 0x01, r, g, b, 0, 0, 0, 0, 0, *mask_bytes(mask, width))
+
+
+def f_seg_kelvin(k, mask, width):
+    k = clamp_k(k)
+    return frame(0x33, 0x05, 0x15, 0x01, 0, 0, 0, k >> 8, k & 0xFF, 0, 0, 0, *mask_bytes(mask, width))
+
+
+def f_seg_brightness(p, mask, width):
+    return frame(0x33, 0x05, 0x15, 0x02, p, *mask_bytes(mask, width))
+
+
 class Lamp:
-    """Sends batches of frames as single ptReal datagrams, spaced at least MIN_GAP apart."""
+    """Sends frames as ptReal datagrams (several frames per datagram), spaced at least MIN_GAP apart."""
 
     def __init__(self, ip):
-        self.addr = (ip, LAMP_PORT)
+        self.ip = ip
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.lock = threading.Lock()
         self.last = 0.0
@@ -125,9 +167,9 @@ class Lamp:
                 wait = self.last + MIN_GAP - time.monotonic()
                 if wait > 0:
                     time.sleep(wait)
-                self.sock.sendto(json.dumps(msg).encode(), self.addr)
+                self.sock.sendto(json.dumps(msg).encode(), (self.ip, LAMP_PORT))
                 self.last = time.monotonic()
-            log(f"-> lamp: {' | '.join(f.hex(' ') for f in chunk)}")
+            log(f"-> {self.ip}: {' | '.join(f.hex(' ') for f in chunk)}")
 
 
 # ---------------------------------------------------------------- minimal MQTT 3.1.1 client
@@ -160,7 +202,7 @@ class MQTT:
     def connect(self, will_topic, will_msg):
         self.sock = socket.create_connection((MQTT_HOST, MQTT_PORT), timeout=10)
         flags = 0x02 | 0x04 | 0x20          # clean session, will flag, will retain (QoS 0)
-        payload = _str(f"govee-lan-bridge-{DEVICE_ID}") + _str(will_topic) + _str(will_msg)
+        payload = _str("govee-lan-bridge") + _str(will_topic) + _str(will_msg)
         if MQTT_USER:
             flags |= 0x80
             payload += _str(MQTT_USER)
@@ -232,54 +274,157 @@ class MQTT:
                 pass
 
 
-# ---------------------------------------------------------------- bridge logic
+# ---------------------------------------------------------------- inventory (govee2mqtt + devices.toml)
 
-class Bridge:
-    def __init__(self):
-        self.lamp = Lamp(LAMP_IP)
-        self.mqtt = MQTT(self.handle)
-        # Last-set state per section (restored from retained MQTT state at startup).
-        self.state = {
-            "ripple": {"state": "OFF", "brightness": 255, "color_mode": "color_temp", "color_temp": 4000, "color": {"r": 255, "g": 200, "b": 150}},
-            "side":   {"state": "OFF", "brightness": 255, "color_mode": "color_temp", "color_temp": 4000, "color": {"r": 255, "g": 200, "b": 150}},
-            "lower":  {"state": "OFF", "brightness": 255, "color_mode": "color_temp", "color_temp": 4000},
-        }
-        # Each side segment's own setting; "on" is the segment's own on/off (the section may still be off).
-        self.segs = [{"on": True, "brightness": 255, "color_mode": "color_temp", "color_temp": 4000,
-                      "color": {"r": 255, "g": 200, "b": 150}} for _ in range(SEGMENTS)]
-        self.flow = 20
-        self.on_order = []            # sections in the order they were turned on (lamp allows two)
-        self.restoring = True
-        self.pending = {}             # commands waiting for the batch window to close
-        self.plock = threading.Lock()
-        self.timer = None
+CONFIG_HEADER = """# govee-lan-bridge devices
+#
+# Maintained by the bridge: every light govee2mqtt reports is added here automatically and IP addresses
+# are kept up to date. Your edits are kept: change `key` (entity ID prefix) or `name`, set `enabled`, or
+# describe a model the bridge doesn't know yet with `family` ("segments" or "sections") and `segments`.
+# If govee2mqtt's API is unavailable, the bridge runs from this file.
+"""
 
-    # -- discovery --------------------------------------------------------
-    def device(self):
-        return {"identifiers": [f"govee_lan_{DEVICE_ID}"], "name": DEVICE_NAME,
-                "manufacturer": "Govee", "model": "H60B0 (LAN bridge)"}
 
-    def light_config(self, key, name, modes):
-        return {"name": name, "unique_id": f"{DEVICE_ID}_{key}", "object_id": f"{DEVICE_ID}_{key}",
-                "schema": "json", "command_topic": f"{BASE}/{key}/set", "state_topic": f"{BASE}/{key}/state",
+def toml_value(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    return json.dumps(str(v))
+
+
+def toml_block(entry, note=""):
+    lines = ["", "[[device]]"]
+    for k in ("id", "sku", "ip", "key", "name", "enabled", "family", "segments"):
+        if k in entry and entry[k] not in (None, ""):
+            lines.append(f"{k} = {toml_value(entry[k])}")
+    if note:
+        lines.append(f"# {note}")
+    return "\n".join(lines) + "\n"
+
+
+class Inventory:
+    """Merges govee2mqtt's device list into devices.toml and returns the lights to bridge."""
+
+    def __init__(self, path=CONFIG_PATH, url=GOVEE2MQTT_URL):
+        self.path, self.url = path, url
+
+    def load(self):
+        try:
+            with open(self.path, "rb") as f:
+                return tomllib.load(f).get("device", [])
+        except FileNotFoundError:
+            return []
+
+    def fetch(self):
+        with urllib.request.urlopen(f"{self.url}/api/devices", timeout=10) as r:
+            return json.load(r)
+
+    def sync(self, discovered=None):
+        """Update the config file from govee2mqtt (if reachable) and return the entries."""
+        entries = self.load()
+        if discovered is None:
+            try:
+                discovered = self.fetch()
+            except Exception as e:
+                log(f"govee2mqtt API unavailable ({e!r}); using {self.path}")
+                discovered = []
+        text = open(self.path, encoding="utf8").read() if os.path.exists(self.path) else CONFIG_HEADER
+        changed = False
+        by_id = {e.get("id"): e for e in entries if e.get("id")}
+        for d in discovered:
+            did, sku, ip = d.get("id"), (d.get("sku") or "").upper(), d.get("ip")
+            if not did:
+                continue
+            if did in by_id:
+                e = by_id[did]
+                if ip and e.get("ip") != ip:              # keep the recorded IP current
+                    text = self.replace_ip(text, did, ip)
+                    e["ip"], changed = ip, True
+                continue
+            entry = {"id": did, "sku": sku, "ip": ip, "name": d.get("name") or sku}
+            if sku in PROFILES:
+                entry["enabled"] = True
+                note = ""
+            else:
+                entry["enabled"] = False
+                note = "no built-in profile: add family/segments and set enabled = true to bridge it"
+            if LEGACY_IP and ip == LEGACY_IP and LEGACY_KEY:  # v1 single-lamp install: keep its entity IDs
+                entry["key"] = LEGACY_KEY
+                entry["name"] = LEGACY_NAME or entry["name"]
+            entry.setdefault("key", slug(entry["name"]))
+            text += toml_block(entry, note)
+            entries.append(entry)
+            by_id[did] = entry
+            changed = True
+            log(f"discovered {sku} {did} at {ip} -> {'bridged' if entry['enabled'] else 'recorded (no profile)'}")
+        if LEGACY_IP and LEGACY_KEY and not any(e.get("ip") == LEGACY_IP for e in entries):
+            entry = {"ip": LEGACY_IP, "sku": "H60B0", "key": LEGACY_KEY, "name": LEGACY_NAME or LEGACY_KEY, "enabled": True}
+            text += toml_block(entry, "from v1 LAMP_IP/DEVICE_ID settings")
+            entries.append(entry)
+            changed = True
+        if changed:
+            self.write(text)
+        return entries
+
+    @staticmethod
+    def replace_ip(text, did, ip):
+        blocks = re.split(r"(?m)^(?=\[\[device\]\])", text)
+        for i, block in enumerate(blocks):
+            if re.search(rf'(?m)^id\s*=\s*"{re.escape(did)}"', block):
+                if re.search(r"(?m)^ip\s*=", block):
+                    blocks[i] = re.sub(r'(?m)^ip\s*=.*$', f"ip = {json.dumps(ip)}", block)
+                else:
+                    blocks[i] = block.replace("[[device]]\n", f"[[device]]\nip = {json.dumps(ip)}\n", 1)
+        return "".join(blocks)
+
+    def write(self, text):
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf8") as f:
+            f.write(text)
+        os.replace(tmp, self.path)
+
+    @staticmethod
+    def profile(entry):
+        """Profile for an entry (config overrides built-in), or None if it can't be bridged."""
+        prof = dict(PROFILES.get((entry.get("sku") or "").upper(), {}))
+        for k in ("family", "segments"):
+            if entry.get(k):
+                prof[k] = entry[k]
+        if prof.get("family") == "sections" or (prof.get("family") == "segments" and int(prof.get("segments", 0)) > 0):
+            return prof
+        return None
+
+
+# ---------------------------------------------------------------- devices
+
+class Device:
+    """One light: owns its state, batching and UDP sender. Subclasses implement the family."""
+
+    model = "Govee light"
+
+    def __init__(self, key, name, ip, sku, mqtt):
+        self.key, self.name, self.sku, self.mqtt = key, name, sku, mqtt
+        self.base = f"{ROOT}/{key}"
+        self.lamp = Lamp(ip)
+        self.pending, self.plock, self.timer = {}, threading.Lock(), None
+
+    def device_info(self):
+        return {"identifiers": [f"govee_lan_{self.key}"], "name": self.name,
+                "manufacturer": "Govee", "model": f"{self.sku} (LAN bridge)"}
+
+    def light_config(self, entity, label, modes, unique=None):
+        uid = unique or f"{self.key}_{entity}"
+        return {"name": label, "unique_id": uid, "object_id": uid, "schema": "json",
+                "command_topic": f"{self.base}/{entity}/set", "state_topic": f"{self.base}/{entity}/state",
                 "brightness": True, "supported_color_modes": modes, "color_temp_kelvin": True,
-                "min_kelvin": MIN_K, "max_kelvin": MAX_K, "device": self.device(),
-                "availability_topic": f"{BASE}/status"}
+                "min_kelvin": MIN_K, "max_kelvin": MAX_K, "device": self.device_info(),
+                "availability_topic": STATUS}
 
-    def discover(self):
-        for name in SECTIONS:
-            modes = ["color_temp"] if name == "lower" else ["rgb", "color_temp"]
-            self.mqtt.publish(f"{DISCOVERY}/light/{DEVICE_ID}/{name}/config",
-                              self.light_config(name, name.capitalize(), modes), retain=True)
-        for i in range(SEGMENTS):
-            self.mqtt.publish(f"{DISCOVERY}/light/{DEVICE_ID}/side_segment_{i + 1}/config",
-                              self.light_config(f"side_segment_{i + 1}", f"Side segment {i + 1}",
-                                                ["rgb", "color_temp"]), retain=True)
-        num = {"name": "Flow rate", "unique_id": f"{DEVICE_ID}_flow_rate", "object_id": f"{DEVICE_ID}_flow_rate",
-               "command_topic": f"{BASE}/flow/set", "state_topic": f"{BASE}/flow/state",
-               "min": 0, "max": 100, "step": 1, "mode": "slider", "icon": "mdi:rotate-3d-variant",
-               "device": self.device(), "availability_topic": f"{BASE}/status"}
-        self.mqtt.publish(f"{DISCOVERY}/number/{DEVICE_ID}/flow_rate/config", num, retain=True)
+    def publish_light(self, entity, label, modes):
+        self.mqtt.publish(f"{DISCOVERY}/light/{self.key}/{entity}/config",
+                          self.light_config(entity, label, modes), retain=True)
 
     @staticmethod
     def light_payload(s, on):
@@ -290,62 +435,275 @@ class Bridge:
             out["color"] = s["color"]
         return out
 
-    def publish_state(self, name):
-        s = self.state[name]
-        self.mqtt.publish(f"{BASE}/{name}/state", self.light_payload(s, s["state"] == "ON"), retain=True)
-        if name == "side":
-            self.publish_segments()
+    @staticmethod
+    def apply_colour(target, cmd):
+        """Copy colour/temperature/brightness from an HA command into a state dict; True if colour changed."""
+        changed = False
+        if "color" in cmd:
+            target["color"], target["color_mode"] = {k: int(cmd["color"][k]) for k in "rgb"}, "rgb"
+            changed = True
+        elif "color_temp" in cmd:
+            target["color_temp"], target["color_mode"] = clamp_k(cmd["color_temp"]), "color_temp"
+            changed = True
+        if "brightness" in cmd:
+            target["brightness"] = int(cmd["brightness"])
+        return changed
 
-    def publish_segments(self):
-        side_on = self.state["side"]["state"] == "ON"
+    # -- batching ---------------------------------------------------------
+    def queue(self, entity, value):
+        """Collect commands arriving close together (e.g. a scene) and apply them as one change."""
+        with self.plock:
+            if isinstance(value, dict) and entity in self.pending:
+                self.pending[entity].update(value)
+            else:
+                self.pending[entity] = value
+            if self.timer is None:
+                self.timer = threading.Timer(BATCH_WINDOW, self.flush)
+                self.timer.start()
+
+    def flush(self):
+        with self.plock:
+            pending, self.pending, self.timer = self.pending, {}, None
+        frames = self.apply(pending)
+        unique = []
+        for f in frames:                                  # drop repeated frames (e.g. power on)
+            if f not in unique:
+                unique.append(f)
+        self.lamp.send(unique)                            # one datagram for the whole change
+        self.publish_states()
+
+    # -- MQTT dispatch ------------------------------------------------------------
+    def handle(self, entity, kind, payload, retained, restoring):
+        if kind == "state":
+            if restoring and retained:
+                self.restore(entity, payload)
+            return
+        if kind == "set" and entity in self.entities():
+            self.queue(entity, self.parse(entity, payload))
+
+    def parse(self, entity, payload):
+        return json.loads(payload)
+
+
+class SegmentDevice(Device):
+    """Lights using the 33 05 15 family: whole lamp + N segments; segment off = black."""
+
+    def __init__(self, key, name, ip, sku, mqtt, segments):
+        super().__init__(key, name, ip, sku, mqtt)
+        self.n = int(segments)
+        self.width = (self.n + 7) // 8
+        self.all = (1 << self.n) - 1
+        self.whole = {"state": "OFF", "brightness": 255, "color_mode": "color_temp", "color_temp": 4000,
+                      "color": {"r": 255, "g": 200, "b": 150}}
+        self.segs = [{"on": True, "brightness": 255, "color_mode": "color_temp", "color_temp": 4000,
+                      "color": {"r": 255, "g": 200, "b": 150}} for _ in range(self.n)]
+
+    def entities(self):
+        return ["lamp"] + [f"segment_{i + 1}" for i in range(self.n)]
+
+    def discover(self):
+        self.publish_light("lamp", "Lamp", ["rgb", "color_temp"])
+        for i in range(self.n):
+            self.publish_light(f"segment_{i + 1}", f"Segment {i + 1}", ["rgb", "color_temp"])
+
+    def publish_states(self):
+        on = self.whole["state"] == "ON"
+        self.mqtt.publish(f"{self.base}/lamp/state", self.light_payload(self.whole, on), retain=True)
+        for i, seg in enumerate(self.segs):
+            out = self.light_payload(seg, on and seg["on"])
+            out["segment_on"] = seg["on"]
+            self.mqtt.publish(f"{self.base}/segment_{i + 1}/state", out, retain=True)
+
+    def restore(self, entity, payload):
+        data = json.loads(payload)
+        if entity == "lamp":
+            self.whole.update(data)
+        elif entity.startswith("segment_"):
+            i = int(entity.split("_")[1]) - 1
+            if 0 <= i < self.n:
+                self.segs[i].update({k: data[k] for k in ("brightness", "color_mode", "color", "color_temp") if k in data})
+                self.segs[i]["on"] = data.get("segment_on", data.get("state") == "ON")
+
+    def segment_frames(self, indices):
+        """Frames applying the remembered settings of the given segments; shared settings share a frame."""
+        colours, levels = {}, {}
+        for i in indices:
+            seg, bit = self.segs[i], 1 << i
+            if not seg["on"]:
+                key = ("rgb", 0, 0, 0)                     # black is a true per-segment off
+            elif seg["color_mode"] == "color_temp":
+                key = ("k", seg["color_temp"])
+            else:
+                key = ("rgb", seg["color"]["r"], seg["color"]["g"], seg["color"]["b"])
+            colours[key] = colours.get(key, 0) | bit
+            if seg["on"]:
+                p = pct(seg["brightness"])
+                levels[p] = levels.get(p, 0) | bit
+        frames = [f_seg_kelvin(k[1], m, self.width) if k[0] == "k" else f_seg_rgb(*k[1:], m, self.width)
+                  for k, m in colours.items()]
+        frames += [f_seg_brightness(p, m, self.width) for p, m in levels.items()]
+        return frames
+
+    def apply(self, pending):
+        frames = []
+        cmd = pending.get("lamp")
+        seg_cmds = {int(e.split("_")[1]) - 1: c for e, c in pending.items() if e.startswith("segment_")}
+        if cmd is not None:
+            if cmd.get("state") == "OFF":
+                self.whole["state"] = "OFF"
+                return [f_power(False)]
+            turning_on = self.whole["state"] != "ON"
+            self.whole["state"] = "ON"
+            if turning_on:
+                frames.append(f_power(True))
+            if "brightness" in cmd:
+                self.whole["brightness"] = int(cmd["brightness"])
+                frames.append(f_master(pct(self.whole["brightness"])))
+            elif turning_on:
+                frames.append(f_master(pct(self.whole["brightness"])))
+            colour = {k: v for k, v in cmd.items() if k in ("color", "color_temp")}
+            if colour:                                    # whole-lamp colour repaints every segment
+                self.apply_colour(self.whole, colour)
+                for seg in self.segs:
+                    seg["on"] = True
+                    seg["color_mode"], seg["color"], seg["color_temp"] = (
+                        self.whole["color_mode"], dict(self.whole["color"]), self.whole["color_temp"])
+                frames += self.segment_frames(range(self.n))
+            elif turning_on and not seg_cmds:
+                if not any(seg["on"] for seg in self.segs):
+                    for seg in self.segs:
+                        seg["on"] = True
+                frames += self.segment_frames(range(self.n))
+        if seg_cmds:
+            for i, c in seg_cmds.items():
+                if not 0 <= i < self.n:
+                    continue
+                if c.get("state") == "OFF":
+                    self.segs[i]["on"] = False
+                else:
+                    self.segs[i]["on"] = True
+                    self.apply_colour(self.segs[i], c)
+            if not any(seg["on"] for seg in self.segs):   # last segment off: switch the lamp off
+                self.whole["state"] = "OFF"
+                return frames + [f_power(False)]
+            if self.whole["state"] != "ON":
+                self.whole["state"] = "ON"
+                frames += [f_power(True), f_master(pct(self.whole["brightness"]))]
+                frames += self.segment_frames(range(self.n))
+            else:
+                frames += self.segment_frames(sorted(i for i in seg_cmds if 0 <= i < self.n))
+        return frames
+
+
+class SectionDevice(Device):
+    """Govee H60B0 Uplighter: whole lamp, three sections (two on at once), 8 side segments, flow rate."""
+
+    def __init__(self, key, name, ip, sku, mqtt):
+        super().__init__(key, name, ip, sku, mqtt)
+        self.power = {"state": "ON", "brightness": 255}
+        self.state = {
+            "ripple": {"state": "OFF", "brightness": 255, "color_mode": "color_temp", "color_temp": 4000, "color": {"r": 255, "g": 200, "b": 150}},
+            "side":   {"state": "OFF", "brightness": 255, "color_mode": "color_temp", "color_temp": 4000, "color": {"r": 255, "g": 200, "b": 150}},
+            "lower":  {"state": "OFF", "brightness": 255, "color_mode": "color_temp", "color_temp": 4000},
+        }
+        self.segs = [{"on": True, "brightness": 255, "color_mode": "color_temp", "color_temp": 4000,
+                      "color": {"r": 255, "g": 200, "b": 150}} for _ in range(SIDE_SEGMENTS)]
+        self.flow = 20
+        self.on_order = []            # sections in the order they were turned on (lamp allows two)
+
+    def entities(self):
+        return ["lamp", "flow", *SECTIONS, *(f"side_segment_{i + 1}" for i in range(SIDE_SEGMENTS))]
+
+    def parse(self, entity, payload):
+        if entity == "flow":
+            return max(0, min(100, int(float(payload))))
+        return json.loads(payload)
+
+    # -- discovery / state ----------------------------------------------------
+    def discover(self):
+        cfg = self.light_config("lamp", "Lamp", ["brightness"])
+        self.mqtt.publish(f"{DISCOVERY}/light/{self.key}/lamp/config", cfg, retain=True)
+        for name in SECTIONS:
+            self.publish_light(name, name.capitalize(), ["color_temp"] if name == "lower" else ["rgb", "color_temp"])
+        for i in range(SIDE_SEGMENTS):
+            self.publish_light(f"side_segment_{i + 1}", f"Side segment {i + 1}", ["rgb", "color_temp"])
+        num = {"name": "Flow rate", "unique_id": f"{self.key}_flow_rate", "object_id": f"{self.key}_flow_rate",
+               "command_topic": f"{self.base}/flow/set", "state_topic": f"{self.base}/flow/state",
+               "min": 0, "max": 100, "step": 1, "mode": "slider", "icon": "mdi:rotate-3d-variant",
+               "device": self.device_info(), "availability_topic": STATUS}
+        self.mqtt.publish(f"{DISCOVERY}/number/{self.key}/flow_rate/config", num, retain=True)
+
+    def publish_states(self):
+        powered = self.power["state"] == "ON"
+        self.mqtt.publish(f"{self.base}/lamp/state", {"state": self.power["state"], "brightness": self.power["brightness"],
+                                                      "color_mode": "brightness"}, retain=True)
+        for name, s in self.state.items():
+            self.mqtt.publish(f"{self.base}/{name}/state", self.light_payload(s, powered and s["state"] == "ON"), retain=True)
+        side_on = powered and self.state["side"]["state"] == "ON"
         for i, seg in enumerate(self.segs):
             out = self.light_payload(seg, side_on and seg["on"])
-            out["segment_on"] = seg["on"]            # the segment's own setting, kept across section off/on
-            self.mqtt.publish(f"{BASE}/side_segment_{i + 1}/state", out, retain=True)
+            out["segment_on"] = seg["on"]
+            self.mqtt.publish(f"{self.base}/side_segment_{i + 1}/state", out, retain=True)
+        self.mqtt.publish(f"{self.base}/flow/state", str(self.flow), retain=True)
 
-    # -- segment frames ---------------------------------------------------------
-    def segment_frames(self, indices):
-        """Frames applying the remembered settings of the given segments. Segments that share a
-        colour or a brightness are combined into one frame with a merged mask."""
+    def restore(self, entity, payload):
+        if entity == "flow":
+            self.flow = int(float(payload))
+            return
+        data = json.loads(payload)
+        if entity == "lamp":
+            self.power.update({k: data[k] for k in ("state", "brightness") if k in data})
+        elif entity in self.state:
+            self.state[entity].update(data)
+            if data.get("state") == "ON" and entity not in self.on_order:
+                self.on_order.append(entity)
+        elif entity.startswith("side_segment_"):
+            i = int(entity.rsplit("_", 1)[1]) - 1
+            if 0 <= i < SIDE_SEGMENTS:
+                self.segs[i].update({k: data[k] for k in ("brightness", "color_mode", "color", "color_temp") if k in data})
+                self.segs[i]["on"] = data.get("segment_on", data.get("state") == "ON")
+
+    # -- commands ------------------------------------------------------------
+    def side_segment_frames(self, indices):
         colours, levels = {}, {}
         for i in indices:
             seg, bit = self.segs[i], 1 << i
             key = (("k", seg["color_temp"]) if seg["color_mode"] == "color_temp"
                    else ("rgb", seg["color"]["r"], seg["color"]["g"], seg["color"]["b"]))
             colours[key] = colours.get(key, 0) | bit
-            p = pct(seg["brightness"]) if seg["on"] else SEG_OFF_PCT
+            p = pct(seg["brightness"]) if seg["on"] else SIDE_OFF_PCT
             levels[p] = levels.get(p, 0) | bit
-        frames = [f_kelvin(2, key[1], mask) if key[0] == "k" else f_rgb(2, *key[1:], mask=mask)
-                  for key, mask in colours.items()]
-        frames += [f_brightness(2, p, mask) for p, mask in levels.items()]
+        frames = [f_kelvin(2, k[1], m) if k[0] == "k" else f_rgb(2, *k[1:], mask=m) for k, m in colours.items()]
+        frames += [f_brightness(2, p, m) for p, m in levels.items()]
         return frames
 
-    # -- commands ------------------------------------------------------------
+    def power_on_frames(self):
+        if self.power["state"] == "ON":
+            return [f_power(True)]
+        self.power["state"] = "ON"
+        return [f_power(True), f_master(pct(self.power["brightness"]))]
+
     def section_frames(self, name, cmd, protect=()):
-        """Frames for one section's command; updates self.state."""
         sec, s, frames = SECTIONS[name], self.state[name], []
         if cmd.get("state") == "OFF":
             s["state"] = "OFF"
             if name in self.on_order:
                 self.on_order.remove(name)
             return [f_section(sec, False)]
-        turning_on = s["state"] != "ON"
+        turning_on = s["state"] != "ON" or self.power["state"] != "ON"
         s["state"] = "ON"
         if turning_on:
             frames += self.make_room(name, protect)
-            frames += [f_power(True), f_section(sec, True)]
+            frames += self.power_on_frames() + [f_section(sec, True)]
         if name in self.on_order:
             self.on_order.remove(name)
         self.on_order.append(name)
         if name == "side":
             return frames + self.side_frames(cmd, turning_on)
-        if "color" in cmd and name != "lower":
-            c = cmd["color"]
-            s["color"], s["color_mode"] = {k: int(c[k]) for k in "rgb"}, "rgb"
-            frames.append(f_rgb(sec, *(s["color"][k] for k in "rgb")))
-        elif "color_temp" in cmd:
-            s["color_temp"], s["color_mode"] = clamp_k(cmd["color_temp"]), "color_temp"
-            frames.append(f_kelvin(sec, s["color_temp"]))
+        colour = {k: v for k, v in cmd.items() if k in ("color", "color_temp") and not (name == "lower" and k == "color")}
+        if self.apply_colour(s, colour):
+            frames.append(f_kelvin(sec, s["color_temp"]) if s["color_mode"] == "color_temp"
+                          else f_rgb(sec, *(s["color"][k] for k in "rgb")))
         elif turning_on:              # re-apply remembered colour so the section comes back as it was
             frames.append(f_kelvin(sec, s["color_temp"]) if s["color_mode"] == "color_temp"
                           else f_rgb(sec, *(s["color"][k] for k in "rgb")))
@@ -358,157 +716,151 @@ class Bridge:
 
     def side_frames(self, cmd, turning_on):
         """Whole-ring command: colour/brightness repaint every segment; plain 'on' restores the pattern."""
-        s, repaint = self.state["side"], False
-        if "color" in cmd:
-            s["color"], s["color_mode"] = {k: int(cmd["color"][k]) for k in "rgb"}, "rgb"
-            repaint = True
-        elif "color_temp" in cmd:
-            s["color_temp"], s["color_mode"] = clamp_k(cmd["color_temp"]), "color_temp"
-            repaint = True
-        if "brightness" in cmd:
-            s["brightness"] = int(cmd["brightness"])
-            repaint = True
-        if repaint:
+        s = self.state["side"]
+        colour_changed = self.apply_colour(s, {k: v for k, v in cmd.items() if k in ("color", "color_temp")})
+        if colour_changed or "brightness" in cmd:
+            if "brightness" in cmd:
+                s["brightness"] = int(cmd["brightness"])
             for seg in self.segs:
                 seg["on"] = True
-                if "color" in cmd or "color_temp" in cmd:
+                if colour_changed:
                     seg["color_mode"], seg["color"], seg["color_temp"] = s["color_mode"], dict(s["color"]), s["color_temp"]
                 if "brightness" in cmd:
                     seg["brightness"] = s["brightness"]
-            return self.segment_frames(range(SEGMENTS))
+            return self.side_segment_frames(range(SIDE_SEGMENTS))
         if turning_on:
-            if not any(seg["on"] for seg in self.segs):  # nothing lit to restore: light the whole ring
+            if not any(seg["on"] for seg in self.segs):
                 for seg in self.segs:
                     seg["on"] = True
-            return self.segment_frames(range(SEGMENTS))
+            return self.side_segment_frames(range(SIDE_SEGMENTS))
         return []
 
     def apply_segments(self, seg_cmds, protect):
-        """Segment commands: update segment settings, then light the side section if needed."""
         for i, cmd in seg_cmds.items():
             seg = self.segs[i]
             if cmd.get("state") == "OFF":
                 seg["on"] = False
                 continue
             seg["on"] = True
-            if "color" in cmd:
-                seg["color"], seg["color_mode"] = {k: int(cmd["color"][k]) for k in "rgb"}, "rgb"
-            elif "color_temp" in cmd:
-                seg["color_temp"], seg["color_mode"] = clamp_k(cmd["color_temp"]), "color_temp"
-            if "brightness" in cmd:
-                seg["brightness"] = int(cmd["brightness"])
+            self.apply_colour(seg, cmd)
         side = self.state["side"]
-        if not any(seg["on"] for seg in self.segs):       # last lit segment went off: switch the section off
+        if not any(seg["on"] for seg in self.segs):
             return self.section_frames("side", {"state": "OFF"}) if side["state"] == "ON" else []
-        if side["state"] != "ON":
-            return self.section_frames("side", {"state": "ON"}, protect)   # restores every segment
-        return self.segment_frames(sorted(seg_cmds))
+        if side["state"] != "ON" or self.power["state"] != "ON":
+            return self.section_frames("side", {"state": "ON"}, protect)
+        return self.side_segment_frames(sorted(seg_cmds))
 
     def make_room(self, name, protect=()):
         """The lamp allows two sections at once: switch off the longest-on other section,
         preferring sections that aren't being turned on in the same change."""
         on = [n for n in self.on_order if n != name and self.state[n]["state"] == "ON"]
-        on.sort(key=lambda n: n in protect)          # stable: unprotected (oldest first) go first
+        on.sort(key=lambda n: n in protect)
         frames = []
         while len(on) >= 2:
             victim = on.pop(0)
             self.state[victim]["state"] = "OFF"
             self.on_order.remove(victim)
             frames.append(f_section(SECTIONS[victim], False))
-            self.publish_state(victim)
-            log(f"two-section limit: turned {victim} off")
+            log(f"{self.key}: two-section limit, turned {victim} off")
         return frames
 
-    @staticmethod
-    def segment_index(target):
-        if target.startswith("side_segment_"):
-            try:
-                i = int(target.rsplit("_", 1)[1]) - 1
-            except ValueError:
-                return None
-            return i if 0 <= i < SEGMENTS else None
-        return None
-
-    def handle(self, topic, payload, retained):
-        parts = topic.split("/")
-        target = parts[-2]
-        # Retained state topics: restore memory at startup only, never drive the lamp.
-        if parts[-1] == "state":
-            if self.restoring and retained:
-                data = json.loads(payload) if target != "flow" else None
-                if target in self.state:
-                    self.state[target].update(data)
-                    if self.state[target]["state"] == "ON" and target not in self.on_order:
-                        self.on_order.append(target)
-                elif self.segment_index(target) is not None:
-                    seg = self.segs[self.segment_index(target)]
-                    seg.update({k: data[k] for k in ("brightness", "color_mode", "color", "color_temp") if k in data})
-                    seg["on"] = data.get("segment_on", data.get("state") == "ON")
-                elif target == "flow":
-                    self.flow = int(float(payload))
-            return
-        if parts[-1] != "set":
-            return
-        if target == "flow":
-            value = max(0, min(100, int(float(payload))))
-        elif target in SECTIONS or self.segment_index(target) is not None:
-            value = json.loads(payload)
-        else:
-            return
-        # Collect commands arriving close together (e.g. a scene) and apply them as one change.
-        with self.plock:
-            if isinstance(value, dict) and target in self.pending:
-                self.pending[target].update(value)
-            else:
-                self.pending[target] = value
-            if self.timer is None:
-                self.timer = threading.Timer(BATCH_WINDOW, self.flush)
-                self.timer.start()
-
-    def flush(self):
-        """Apply all pending commands as one change: offs, then ons, then segments, in one datagram."""
-        with self.plock:
-            pending, self.pending, self.timer = self.pending, {}, None
-        seg_cmds = {self.segment_index(t): c for t, c in pending.items() if self.segment_index(t) is not None}
-        frames, touched = [], set()
+    def apply(self, pending):
+        frames = []
+        lamp = pending.get("lamp")
+        if lamp is not None and lamp.get("state") == "OFF":
+            self.power["state"] = "OFF"
+            return [f_power(False)]
+        if lamp is not None:
+            frames += self.power_on_frames()
+            if "brightness" in lamp:
+                self.power["brightness"] = int(lamp["brightness"])
+                frames.append(f_master(pct(self.power["brightness"])))
+        seg_cmds = {int(t.rsplit("_", 1)[1]) - 1: c for t, c in pending.items() if t.startswith("side_segment_")}
         offs = [n for n in SECTIONS if n in pending and pending[n].get("state") == "OFF"]
         ons = [n for n in SECTIONS if n in pending and n not in offs]
         protect = set(ons) | ({"side"} if any(c.get("state") != "OFF" for c in seg_cmds.values()) else set())
         for name in offs + ons:
             frames += self.section_frames(name, pending[name], protect=protect)
-            touched.add(name)
         if seg_cmds:
-            frames += self.apply_segments(seg_cmds, protect)
-            touched.add("side")
+            frames += self.apply_segments({i: c for i, c in seg_cmds.items() if 0 <= i < SIDE_SEGMENTS}, protect)
         if "flow" in pending:
             self.flow = pending["flow"]
             frames.append(f_flow(self.flow))
-        unique = []
-        for f in frames:                                  # drop repeated frames (e.g. power on)
-            if f not in unique:
-                unique.append(f)
-        self.lamp.send(unique)                            # one datagram for the whole change
-        for name in sorted(touched):
-            self.publish_state(name)
-        if "flow" in pending:
-            self.mqtt.publish(f"{BASE}/flow/state", str(self.flow), retain=True)
+        return frames
 
-    # -- main loop ----------------------------------------------------------------
+
+def make_device(entry, mqtt):
+    prof = Inventory.profile(entry)
+    if not prof or not entry.get("enabled", True) or not entry.get("ip"):
+        return None
+    key = entry.get("key") or slug(entry.get("name") or entry.get("id") or entry["ip"])
+    args = (key, entry.get("name") or key, entry["ip"], (entry.get("sku") or "").upper(), mqtt)
+    if prof["family"] == "sections":
+        return SectionDevice(*args)
+    return SegmentDevice(*args, segments=prof["segments"])
+
+
+# ---------------------------------------------------------------- bridge
+
+class Bridge:
+    def __init__(self, inventory=None):
+        self.inventory = inventory or Inventory()
+        self.mqtt = MQTT(self.handle)
+        self.devices = {}             # key -> Device
+        self.restoring = True
+        self.dlock = threading.Lock()
+
+    def load_devices(self, discovered=None):
+        """(Re)build the device list from govee2mqtt + devices.toml; keeps existing instances."""
+        entries = self.inventory.sync(discovered)
+        added = []
+        with self.dlock:
+            for entry in entries:
+                dev = make_device(entry, self.mqtt)
+                if dev is None:
+                    continue
+                if dev.key in self.devices:
+                    self.devices[dev.key].lamp.ip = dev.lamp.ip      # IP may have changed
+                else:
+                    self.devices[dev.key] = dev
+                    added.append(dev)
+        return added
+
+    def handle(self, topic, payload, retained):
+        parts = topic.split("/")
+        if len(parts) != 4 or parts[0] != ROOT:
+            return
+        _, key, entity, kind = parts
+        dev = self.devices.get(key)
+        if dev:
+            dev.handle(entity, kind, payload, retained, self.restoring)
+
+    def refresher(self):
+        while True:
+            time.sleep(REFRESH)
+            try:
+                for dev in self.load_devices():
+                    dev.discover()
+                    dev.publish_states()
+                    log(f"bridging new light {dev.key} ({dev.sku}) at {dev.lamp.ip}")
+            except Exception as e:
+                log(f"refresh failed: {e!r}")
+
     def run(self):
+        self.load_devices()
+        log("lights: " + (", ".join(f"{d.key} ({d.sku} @ {d.lamp.ip})" for d in self.devices.values()) or "none"))
+        threading.Thread(target=self.refresher, daemon=True).start()
         backoff = 2
         while True:
             try:
-                self.mqtt.connect(f"{BASE}/status", "offline")
-                log(f"connected to MQTT {MQTT_HOST}:{MQTT_PORT}; lamp {LAMP_IP}")
+                self.mqtt.connect(STATUS, "offline")
+                log(f"connected to MQTT {MQTT_HOST}:{MQTT_PORT}")
                 self.restoring = True
-                self.discover()
-                for name in SECTIONS:
-                    self.mqtt.subscribe(f"{BASE}/{name}/state")
-                for i in range(SEGMENTS):
-                    self.mqtt.subscribe(f"{BASE}/side_segment_{i + 1}/state")
-                self.mqtt.subscribe(f"{BASE}/flow/state")
+                for dev in list(self.devices.values()):
+                    dev.discover()
+                self.mqtt.subscribe(f"{ROOT}/+/+/state")
                 threading.Timer(2.0, self.finish_restore).start()
-                self.mqtt.publish(f"{BASE}/status", "online", retain=True)
+                self.mqtt.publish(STATUS, "online", retain=True)
                 backoff = 2
                 self.mqtt.loop()
             except Exception as e:
@@ -519,18 +871,11 @@ class Bridge:
     def finish_restore(self):
         """After retained state has arrived, start listening for commands and republish state."""
         self.restoring = False
-        for name in SECTIONS:
-            self.mqtt.subscribe(f"{BASE}/{name}/set")
-            self.publish_state(name)
-        for i in range(SEGMENTS):
-            self.mqtt.subscribe(f"{BASE}/side_segment_{i + 1}/set")
-        self.mqtt.subscribe(f"{BASE}/flow/set")
-        self.mqtt.publish(f"{BASE}/flow/state", str(self.flow), retain=True)
-        log(f"ready; restored state: { {n: s['state'] for n, s in self.state.items()} }, "
-            f"segments on: {[i + 1 for i, s in enumerate(self.segs) if s['on']]}, flow {self.flow}")
+        self.mqtt.subscribe(f"{ROOT}/+/+/set")
+        for dev in list(self.devices.values()):
+            dev.publish_states()
+        log("ready")
 
 
 if __name__ == "__main__":
-    if not LAMP_IP:
-        raise SystemExit("LAMP_IP is not set: give the lamp's LAN IP address (and a DHCP reservation)")
     Bridge().run()

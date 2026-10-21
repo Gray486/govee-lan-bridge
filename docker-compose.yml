@@ -2,14 +2,14 @@
 services:
   govee-lan-bridge:
     container_name: govee-lan-bridge
-    image: swilli23/govee-lan-bridge:latest
+    image: swilli23/govee-lan-bridge:2
     restart: unless-stopped
-    network_mode: host          # reaches the MQTT broker and the lamp on the LAN
+    network_mode: host            # reaches the MQTT broker, govee2mqtt and the lights on the LAN
+    user: "1000:1000"             # owner of the config folder below (`id -u` / `id -g`)
+    volumes:
+      - /path/to/govee-lan-bridge:/config   # devices.toml is created and maintained here
     environment:
-      LAMP_IP: 192.0.2.10       # your lamp's LAN IP (give it a DHCP reservation)
-      MQTT_HOST: 127.0.0.1      # your MQTT broker (the one Home Assistant uses)
-      MQTT_PORT: "1883"
-      # MQTT_USER: ""           # if your broker requires authentication
+      MQTT_HOST: 127.0.0.1                  # the broker Home Assistant uses
+      GOVEE2MQTT_URL: http://127.0.0.1:8056 # govee2mqtt's web UI; lights are discovered from it
+      # MQTT_USER: ""                       # if your broker requires authentication
       # MQTT_PASS: ""
-      DEVICE_ID: living_room_uplight   # becomes the entity id prefix in Home Assistant
-      DEVICE_NAME: Living Room Uplight
