@@ -44,7 +44,7 @@ print("PASS  safety rules (clamp, no RGB on lower, side mask)")
 # Logic with fake MQTT and lamp.
 class FakeLamp:
     def __init__(self): self.sent = []
-    def send(self, frames): self.sent.append([hexf(f)[:17] for f in frames])
+    def send(self, frames): self.sent.append([hexf(f) for f in frames])
 
 
 class FakeMQTT:
@@ -72,7 +72,7 @@ cmd("lower", color={"r": 1, "g": 2, "b": 3})     # colour on lower is ignored, n
 assert not br.lamp.sent[n:] or br.lamp.sent[-1] == [], f"colour must never reach the lower light, got {br.lamp.sent[-1]}"
 print("PASS  colour commands to the lower light are dropped")
 cmd("side", state="OFF")
-assert br.lamp.sent[-1] == ["33 30 02 00 00 00"], br.lamp.sent[-1]
+assert len(br.lamp.sent[-1]) == 1 and br.lamp.sent[-1][0].startswith("33 30 02 00"), br.lamp.sent[-1]
 print("PASS  off is a single section-off frame")
 br.handle(f"{B.BASE}/flow/set", b"75", False)
 br.timer.cancel(); br.flush()
@@ -94,4 +94,80 @@ for order in itertools.permutations([("ripple", {"state": "ON", "color": {"r": 9
     assert not any(f.startswith("33 30 02 00") for f in br.lamp.sent[-1]), "side must not be switched off"
     assert len(br.lamp.sent[-1]) > 1
 print("PASS  scene race: every command order lands as defined, in one datagram")
+
+
+# ---- side segments (v1.2)
+def fresh(side_on=True):
+    b = B.Bridge()
+    b.lamp, b.mqtt, b.restoring = FakeLamp(), FakeMQTT(), False
+    if side_on:
+        b.state["side"]["state"], b.on_order = "ON", ["side"]
+    return b
+
+
+def seg(b, i, **kw):
+    b.handle(f"{B.BASE}/side_segment_{i}/set", json.dumps(kw).encode(), False)
+
+
+def go(b):
+    b.timer.cancel()
+    b.flush()
+    return b.lamp.sent[-1]
+
+
+# Frames match the live-verified segment commands (segment 1 blue, segment 5 green).
+assert hexf(B.f_rgb(2, 0, 0, 255, mask=0x01)).startswith("33 05 2c 02 01 00 00 ff 00 00 01")
+assert hexf(B.f_rgb(2, 0, 255, 0, mask=0x10)).startswith("33 05 2c 02 01 00 ff 00 00 00 10")
+print("PASS  segment frames match the live-verified commands")
+
+b = fresh()
+for i in range(1, 9):
+    seg(b, i, state="ON", color={"r": 255, "g": 0, "b": 0} if i % 2 else {"r": 0, "g": 0, "b": 255}, brightness=255)
+sent = go(b)
+colour = [f for f in sent if f.startswith("33 05 2c 02 01")]
+assert len(colour) == 2, f"8 segments in 2 colours must be 2 frames, got {sent}"
+assert len(b.lamp.sent) == 1, "one datagram"
+print("PASS  8 segments in 2 colours -> 2 colour frames (merged masks), one datagram")
+
+b = fresh()
+for i in range(1, 9):
+    seg(b, i, state="ON", brightness=3 if i % 2 else 255)    # alternating dim/bright like the live test
+sent = go(b)
+bri = sorted(f[:20] for f in sent if f.startswith("33 05 2c 02 02"))
+assert bri == ["33 05 2c 02 02 01 55", "33 05 2c 02 02 64 aa"], bri
+print("PASS  alternating 1%/100% -> masks 0x55 / 0xaa, exactly as verified on the lamp")
+
+b = fresh(side_on=False)
+b.state["ripple"]["state"] = b.state["lower"]["state"] = "ON"
+b.on_order = ["ripple", "lower"]
+seg(b, 3, state="ON", color={"r": 0, "g": 255, "b": 0})
+sent = go(b)
+assert b.state["side"]["state"] == "ON" and b.state["ripple"]["state"] == "OFF", "segment must light side, evicting oldest"
+assert any(f.startswith("33 30 02 01") for f in sent) and any(f.startswith("33 30 01 00") for f in sent)
+print("PASS  segment command with side off: side turns on, oldest section makes room")
+
+b = fresh()
+for i in range(1, 9):
+    seg(b, i, state="OFF")
+sent = go(b)
+assert b.state["side"]["state"] == "OFF" and any(f.startswith("33 30 02 00") for f in sent)
+print("PASS  last lit segment off -> side section off")
+
+b = fresh()
+b.segs[2]["color"], b.segs[2]["color_mode"] = {"r": 1, "g": 2, "b": 3}, "rgb"
+b.handle(f"{B.BASE}/side/set", json.dumps({"state": "ON", "color": {"r": 9, "g": 8, "b": 7}}).encode(), False)
+go(b)
+assert all(s["color"] == {"r": 9, "g": 8, "b": 7} and s["color_mode"] == "rgb" for s in b.segs)
+assert len([t for t, _ in b.mqtt.pub if "side_segment_" in t]) == 8, "all 8 segment states republished"
+print("PASS  whole-ring colour repaints every segment and updates all 8 segment entities")
+
+b = fresh()
+b.segs[0]["color"], b.segs[0]["color_mode"] = {"r": 255, "g": 0, "b": 0}, "rgb"
+b.handle(f"{B.BASE}/side/set", b'{"state": "OFF"}', False)
+go(b)
+b.handle(f"{B.BASE}/side/set", b'{"state": "ON"}', False)
+sent = go(b)
+assert any(f.startswith("33 05 2c 02 01 ff 00 00 00 00 01") for f in sent), "pattern restored on section on"
+print("PASS  side off/on restores the segment pattern")
+
 print("\nALL TESTS PASSED" if not fails else f"\n{fails} FRAME MISMATCHES")

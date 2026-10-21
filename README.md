@@ -15,6 +15,7 @@ With `DEVICE_ID=living_room_uplight` you get:
 | `light.living_room_uplight_ripple` | top ("Ripple"): on/off, brightness, RGB, 2700–6500 K |
 | `light.living_room_uplight_side` | middle ring ("Side", all 8 segments): on/off, brightness, RGB, 2700–6500 K |
 | `light.living_room_uplight_lower` | down light ("Lower"): on/off, brightness, 2700–6500 K |
+| `light.living_room_uplight_side_segment_1` … `_8` | each side segment: on/off, brightness, RGB, 2700–6500 K |
 | `number.living_room_uplight_flow_rate` | rotation speed of the ripple lens, 0–100 (0 ≈ stopped) |
 
 ## Requirements
@@ -43,6 +44,8 @@ services:
 | `MQTT_USER` / `MQTT_PASS` | *(none)* | Broker credentials, if required |
 | `DEVICE_ID` / `DEVICE_NAME` | `govee_h60b0` / `Govee H60B0` | Entity ID prefix / device name |
 | `DISCOVERY_PREFIX` | `homeassistant` | MQTT discovery prefix |
+| `BATCH_WINDOW` | `0.15` | Seconds within which commands are merged into one change |
+| `MAX_FRAMES_PER_PACKET` | `12` | Commands per LAN packet before splitting |
 
 ## Behaviour
 - **The lamp allows two sections on at once.** Turning on a third switches off the section that's been
@@ -52,6 +55,13 @@ services:
   exactly as defined, whatever order Home Assistant sends the commands in.
 - **One packet per change.** Separate LAN packets sent back-to-back get dropped by the lamp, so every
   change (e.g. a scene setting colour and brightness) is sent as a single packet.
+- **Side segments.** The `side` light controls the whole ring and repaints all 8 segments; the segment
+  lights control one each. Turning a segment on lights the side section (two-section rule applies);
+  turning the last lit segment off switches the section off. A segment's "off" is minimum brightness,
+  since the lamp has no per-segment off. Segments sharing a setting are sent as one frame with a merged
+  mask, and the section comes back with its segment pattern intact.
+- **Packet size.** Up to 12 commands per packet (`MAX_FRAMES_PER_PACKET`); larger changes are split
+  into consecutive packets 50 ms apart.
 - **Safety:** colour temperatures are clamped to 2700–6500 K, and the down light never receives colour
   bytes. Either mistake blacks out the lamp until a valid setting is sent.
 - **State is "last set"**. The lamp can't report per-section state over LAN, so changes made in the
