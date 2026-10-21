@@ -6,7 +6,7 @@ no API key, no internet connection.
 Govee's documented LAN API only controls a light as a whole. This bridge sends the lights' own segment
 and section commands over LAN (`ptReal`) and exposes them to Home Assistant through MQTT discovery. It
 finds your lights through [govee2mqtt](https://github.com/wez/govee2mqtt) and keeps a config file of them,
-so new lights show up on their own and the bridge keeps working if govee2mqtt's API ever changes.
+so new lights show up on their own, and the bridge can keep running from that file without govee2mqtt.
 
 ## Supported lights
 | Model | Profile | Entities |
@@ -20,8 +20,14 @@ Other lights using the same command families can be added in the config file wit
 
 Each light gets a whole-lamp light (`light.<key>_lamp`), so you can disable govee2mqtt's entity for it
 and use the bridge alone. The key comes from govee2mqtt: the Govee app room plus the device name if a room
-is set (e.g. `bedroom_h6088_4e96`), otherwise the device name (`h6088_4e96`). The room also becomes the
+is set (e.g. `living_room_h6088_1a2b`), otherwise the device name (`h6088_1a2b`). The room also becomes the
 device's suggested area in Home Assistant. Rename entities in Home Assistant as you like.
+
+### Segment numbering
+On the H61E0 strip, segment 1 is the end nearest the power/data input and the numbers
+increase away from it. Segments 7–10 have blend zones between them, so they cover a longer run of the strip
+and colours there fade into each other; 1–6 and 11–15 are equal-length, directly adjacent blocks. On the H6088
+it's the opposite: cube 1 is the one farthest from the power input.
 
 ### H60B0 entities
 | Entity | Controls |
@@ -35,8 +41,9 @@ device's suggested area in Home Assistant. Rename entities in Home Assistant as 
 
 ## Requirements
 - Lights with **LAN Control** enabled in the Govee Home app
-- govee2mqtt running on the same LAN (for discovery), and an MQTT broker with Home Assistant's MQTT
-  integration (discovery prefix `homeassistant`)
+- An MQTT broker with Home Assistant's MQTT integration (discovery prefix `homeassistant`)
+- [govee2mqtt](https://github.com/wez/govee2mqtt) on the same LAN for automatic discovery (optional: lights
+  can also be listed by hand in `devices.toml`)
 - Docker with host networking on the same LAN as the lights
 
 ## Run
@@ -96,8 +103,8 @@ enabled = true
 ## Behaviour
 - **Scenes apply atomically.** Commands for a light arriving within 150 ms are merged into one change
   and sent in one packet, whatever order Home Assistant sends them in.
-- **Packet size.** The lights drop packets of about 24 commands **entirely**; the bridge sends at most
-  12 per packet and splits larger changes 50 ms apart. Separate packets sent back-to-back also get
+- **Packet size.** The lights accepted 18 commands per packet in testing but dropped 24 **entirely**; the
+  bridge sends at most 12 per packet and splits larger changes 50 ms apart. Separate packets sent back-to-back also get
   dropped, so commands are always bundled.
 - **Segments (`segments` profile).** The whole-lamp light repaints every segment; segment lights control
   one each. A segment's "off" is **black**, which is a true off. Turning the last segment off switches the
@@ -145,10 +152,6 @@ LAN `ptReal` message to UDP port 4003. Several frames can go in one message's `c
 | Lower temperature | `33 05 2c 03 01 KK KK` (**no** RGB bytes) |
 | Lower brightness | `33 05 2c 03 02 <1-100>` |
 
-**Layouts:** H6088 cubes run left to right. The H61E0's 15 segments run clockwise from the bottom centre
-of the monitor; segments 7–10 have blend zones between them, so they cover a longer run of the strip and
-colours there fade into each other.
-
 H60B0 commands were derived from the Govee Home app's Bluetooth traffic; all commands were verified on real
 hardware over LAN.
 
@@ -157,13 +160,23 @@ hardware over LAN.
 python test_bridge.py      # Python 3.11+
 ```
 Checks every frame byte-for-byte against captured or live-verified commands, plus each profile's rules,
-the scene batching, the config file handling and v1 compatibility. It runs offline, and the GitHub Action
+the scene batching and the config file handling. It runs offline, and the GitHub Action
 runs it before publishing an image.
 
-## Publishing
-On every push to `main`, the GitHub Action runs the tests and publishes `latest` (amd64 + arm64) to
-Docker Hub. Tags like `v2.0.0` also publish `2.0.0`, `2.0` and `2`. It needs the repository secrets
-`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a Docker Hub access token with write scope).
+## Contributing
+Reports for other models are welcome, especially lights that use the same `33 05 15` segment commands.
+Useful details: the model (SKU), how many segments the Govee app shows, which end segment 1 is, and whether
+per-segment colour, temperature and brightness work. Open an issue or a pull request with a new profile
+and its tests.
+
+Maintainers: on every push to `main`, the GitHub Action runs the tests and publishes `latest`
+(amd64 + arm64) to Docker Hub. Tags like `v2.1.0` also publish `2.1.0`, `2.1` and `2`. It needs the
+repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a Docker Hub access token with write scope).
+
+## Disclaimer
+Unofficial and not affiliated with or endorsed by Govee. It uses undocumented LAN commands, which a
+firmware update could change. Invalid settings can leave a light dark until a valid setting is sent (see
+Behaviour); no permanent effects were seen in testing. Use at your own risk.
 
 ## License
 MIT. See [LICENSE](LICENSE).
