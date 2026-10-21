@@ -1,0 +1,15 @@
+# Example stack (Portainer: Stacks -> Add stack -> Web editor).
+services:
+  govee-lan-bridge:
+    container_name: govee-lan-bridge
+    image: swilli23/govee-lan-bridge:latest
+    restart: unless-stopped
+    network_mode: host          # reaches the MQTT broker and the lamp on the LAN
+    environment:
+      LAMP_IP: 192.0.2.10       # your lamp's LAN IP (give it a DHCP reservation)
+      MQTT_HOST: 127.0.0.1      # your MQTT broker (the one Home Assistant uses)
+      MQTT_PORT: "1883"
+      # MQTT_USER: ""           # if your broker requires authentication
+      # MQTT_PASS: ""
+      DEVICE_ID: living_room_uplight   # becomes the entity id prefix in Home Assistant
+      DEVICE_NAME: Living Room Uplight
