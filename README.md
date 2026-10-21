@@ -169,10 +169,6 @@ Useful details: the model (SKU), how many segments the Govee app shows, which en
 per-segment colour, temperature and brightness work. Open an issue or a pull request with a new profile
 and its tests.
 
-Maintainers: on every push to `main`, the GitHub Action runs the tests and publishes `latest`
-(amd64 + arm64) to Docker Hub. Tags like `v2.1.0` also publish `2.1.0`, `2.1` and `2`. It needs the
-repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a Docker Hub access token with write scope).
-
 ## Disclaimer
 Unofficial and not affiliated with or endorsed by Govee. It uses undocumented LAN commands, which a
 firmware update could change. Invalid settings can leave a light dark until a valid setting is sent (see
