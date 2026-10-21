@@ -4,7 +4,7 @@ FROM python:3.12-alpine
 WORKDIR /app
 COPY bridge.py .
 
-# devices.toml lives in /config; mount a host folder there and run as its owner (see README).
-RUN mkdir /config && chown nobody /config
-USER nobody
+# devices.toml lives in /config. The bridge starts as root only to make that folder writable,
+# then drops to an unprivileged user (nobody).
+RUN mkdir /config
 CMD ["python", "-u", "/app/bridge.py"]

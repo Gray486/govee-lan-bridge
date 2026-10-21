@@ -19,8 +19,9 @@ Other lights using the same command families can be added in the config file wit
 (see [Adding a light](#adding-a-light)).
 
 Each light gets a whole-lamp light (`light.<key>_lamp`), so you can disable govee2mqtt's entity for it
-and use the bridge alone. With `key = "bedroom_sconces"`, for example, you get `light.bedroom_sconces_lamp`
-and `light.bedroom_sconces_segment_1` … `_6`.
+and use the bridge alone. The key comes from govee2mqtt: the Govee app room plus the device name if a room
+is set (e.g. `bedroom_h6088_4e96`), otherwise the device name (`h6088_4e96`). The room also becomes the
+device's suggested area in Home Assistant. Rename entities in Home Assistant as you like.
 
 ### H60B0 entities
 | Entity | Controls |
@@ -45,9 +46,8 @@ services:
     image: swilli23/govee-lan-bridge:2
     restart: unless-stopped
     network_mode: host
-    user: "1000:1000"                       # owner of the config folder
     volumes:
-      - /path/to/govee-lan-bridge:/config   # devices.toml is created and maintained here
+      - /path/to/govee-lan-bridge:/config   # created automatically; devices.toml is generated here
     environment:
       MQTT_HOST: 127.0.0.1
       GOVEE2MQTT_URL: http://127.0.0.1:8056
@@ -65,8 +65,9 @@ services:
 | `MAX_FRAMES_PER_PACKET` | `12` | Commands per LAN packet before splitting |
 
 ## devices.toml
-The bridge writes this file itself: every light govee2mqtt reports is added, and IP addresses are kept
-current. Your edits and comments are preserved.
+Nothing to set up: the bridge creates this file on first start and maintains it. Every light govee2mqtt
+reports is added, and IP addresses are kept current. Your edits and comments are preserved. (The bridge
+starts as root only to make the config folder writable, then runs as an unprivileged user.)
 
 ```toml
 [[device]]
@@ -78,8 +79,8 @@ name = "Bedroom Sconces"         # device name in Home Assistant
 enabled = true
 ```
 
-- **Set `key` and `name` before a light's first run** if you want friendly entity IDs. Changing `key`
-  later creates new entities.
+- Changing a light's `key` creates new entities. To get friendlier entity IDs, it's usually easier to
+  rename the entities in Home Assistant.
 - Lights without a profile are recorded with `enabled = false`.
 - Several lights of the same model are independent: each has its own entities, state and command queue.
 - If govee2mqtt is unreachable, the bridge runs from this file.
@@ -110,9 +111,9 @@ enabled = true
   the Govee app or by govee2mqtt aren't reflected. State is retained in MQTT across restarts.
 
 ## Upgrading from v1
-v1 configured one H60B0 with `LAMP_IP` / `DEVICE_ID` / `DEVICE_NAME`. Keep those variables for the first
-v2 run: the bridge matches that light and records it with the same key, so entity IDs and scenes are
-unchanged. Add the `/config` volume and `user`, and switch the image to `:2`.
+v1 configured one H60B0 with `LAMP_IP` / `DEVICE_ID` / `DEVICE_NAME`; v2 ignores those and discovers lights
+instead, so the lamp's entities get a new key. Remove the old (now unavailable) v1 entities in Home
+Assistant, then rename the new ones to the old entity IDs if scenes or dashboards refer to them.
 
 ## Protocol notes
 Commands are standard 20-byte Govee frames (data, zero padding, XOR checksum), sent base64-encoded in a

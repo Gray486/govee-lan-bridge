@@ -159,16 +159,17 @@ check("H61E0 a full-strip change fits the packet limit", len(cmd(w, "lamp", {"co
 tmp = tempfile.mkdtemp()
 cfg = os.path.join(tmp, "devices.toml")
 inv = B.Inventory(path=cfg, url="http://unused")
-API = [{"sku": "H60B0", "id": "AA:01", "name": "H60B0_4B83", "ip": "192.0.2.10"},
+API = [{"sku": "H60B0", "id": "AA:01", "name": "H60B0_4B83", "ip": "192.0.2.10", "room": "Sunroom"},
        {"sku": "H6088", "id": "AA:02", "name": "H6088_4E96", "ip": "192.0.2.11"},
        {"sku": "H61E0", "id": "AA:03", "name": "H61E0_141A", "ip": "192.0.2.12"},
        {"sku": "H6004", "id": "AA:04", "name": "H6004_0B96", "ip": "192.0.2.13"}]
-B.LEGACY_IP, B.LEGACY_KEY, B.LEGACY_NAME = "192.0.2.10", "sunroom_uplight", "Sunroom Uplight"
 entries = inv.sync(API)
 text = open(cfg, encoding="utf8").read()
 check("config written with every govee2mqtt light", all(f'id = "{d["id"]}"' in text for d in API))
 by = {e["id"]: e for e in entries}
-check("v1 uplight keeps key sunroom_uplight", by["AA:01"]["key"] == "sunroom_uplight" and by["AA:01"]["name"] == "Sunroom Uplight")
+check("key = room + name when the light has a Govee room", by["AA:01"]["key"] == "sunroom_h60b0_4b83", by["AA:01"])
+check("key = device name when no room", by["AA:03"]["key"] == "h61e0_141a", by["AA:03"])
+check("config file created from scratch (no manual setup)", text.startswith("# govee-lan-bridge devices"))
 check("supported models enabled, unsupported recorded but disabled",
       by["AA:02"]["enabled"] and by["AA:03"]["enabled"] and not by["AA:04"]["enabled"] and "no built-in profile" in text)
 with open(cfg, "a", encoding="utf8") as f:
@@ -187,20 +188,25 @@ devs = [B.make_device(e, FakeMQTT()) for e in entries]
 devs = [x for x in devs if x]
 check("from the file alone: 3 bridged lights with the right families",
       sorted((x.key, type(x).__name__) for x in devs) == [("bedroom_sconces", "SegmentDevice"), ("h61e0_141a", "SegmentDevice"),
-                                                         ("sunroom_uplight", "SectionDevice")], [(x.key, type(x).__name__) for x in devs])
+                                                         ("sunroom_h60b0_4b83", "SectionDevice")], [(x.key, type(x).__name__) for x in devs])
+check("Govee room becomes the suggested HA area",
+      [x for x in devs if x.key == "sunroom_h60b0_4b83"][0].device_info().get("suggested_area") == "Sunroom")
+dup = B.Inventory(path=os.path.join(tmp, "dup.toml"), url="x").sync(
+    [{"sku": "H6088", "id": "D1", "name": "Sconces", "ip": "192.0.2.50"}, {"sku": "H6088", "id": "D2", "name": "Sconces", "ip": "192.0.2.51"}])
+check("two identical lights get distinct keys", sorted(e["key"] for e in dup) == ["sconces", "sconces_2"], [e["key"] for e in dup])
 text3 = text2.replace('sku = "H6004"', 'sku = "H6004"\nfamily = "segments"\nsegments = 4').replace(
     'name = "H6004_0B96"\nenabled = false', 'name = "H6004_0B96"\nenabled = true')
 open(cfg, "w", encoding="utf8").write(text3)
 user = [B.make_device(e, FakeMQTT()) for e in inv.sync([])]
 check("a user-described model gets bridged", any(x and x.key == "h6004_0b96" and x.n == 4 for x in user))
 
-# Entity IDs for the v1 uplight must not change (scenes and dashboards depend on them).
+# Entity naming scheme for the H60B0 (unique IDs and discovery topics derive from the key).
 up = B.SectionDevice("sunroom_uplight", "Sunroom Uplight", "192.0.2.10", "H60B0", FakeMQTT())
 up.discover()
 uids = {p["unique_id"] for t, p in up.mqtt.pub if t.endswith("/config")}
-check("v1 unique IDs unchanged", {"sunroom_uplight_ripple", "sunroom_uplight_side", "sunroom_uplight_lower",
+check("H60B0 unique IDs follow <key>_<entity>", {"sunroom_uplight_ripple", "sunroom_uplight_side", "sunroom_uplight_lower",
                                   "sunroom_uplight_flow_rate", "sunroom_uplight_side_segment_1"} <= uids)
-check("v1 topics unchanged", any(t == "homeassistant/light/sunroom_uplight/ripple/config" for t, _ in up.mqtt.pub))
+check("H60B0 discovery topics", any(t == "homeassistant/light/sunroom_uplight/ripple/config" for t, _ in up.mqtt.pub))
 
 print("\nALL TESTS PASSED" if not fails else f"\n{fails} FAILED")
 raise SystemExit(1 if fails else 0)

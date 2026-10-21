@@ -34,10 +34,6 @@ DISCOVERY = os.environ.get("DISCOVERY_PREFIX", "homeassistant")
 GOVEE2MQTT_URL = os.environ.get("GOVEE2MQTT_URL", "http://127.0.0.1:8056").rstrip("/")
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "/config/devices.toml")
 REFRESH = int(os.environ.get("DISCOVERY_INTERVAL", "600"))      # seconds between govee2mqtt refreshes
-# v1 single-lamp settings: still honoured, so an existing H60B0 keeps its entity IDs.
-LEGACY_IP = os.environ.get("LAMP_IP", "")
-LEGACY_KEY = os.environ.get("DEVICE_ID", "")
-LEGACY_NAME = os.environ.get("DEVICE_NAME", "")
 
 ROOT = "govee_lan"
 STATUS = f"{ROOT}/status"
@@ -295,7 +291,7 @@ def toml_value(v):
 
 def toml_block(entry, note=""):
     lines = ["", "[[device]]"]
-    for k in ("id", "sku", "ip", "key", "name", "enabled", "family", "segments"):
+    for k in ("id", "sku", "ip", "key", "name", "room", "enabled", "family", "segments"):
         if k in entry and entry[k] not in (None, ""):
             lines.append(f"{k} = {toml_value(entry[k])}")
     if note:
@@ -342,30 +338,33 @@ class Inventory:
                     text = self.replace_ip(text, did, ip)
                     e["ip"], changed = ip, True
                 continue
-            entry = {"id": did, "sku": sku, "ip": ip, "name": d.get("name") or sku}
+            entry = {"id": did, "sku": sku, "ip": ip, "name": d.get("name") or sku, "room": d.get("room") or ""}
             if sku in PROFILES:
                 entry["enabled"] = True
                 note = ""
             else:
                 entry["enabled"] = False
                 note = "no built-in profile: add family/segments and set enabled = true to bridge it"
-            if LEGACY_IP and ip == LEGACY_IP and LEGACY_KEY:  # v1 single-lamp install: keep its entity IDs
-                entry["key"] = LEGACY_KEY
-                entry["name"] = LEGACY_NAME or entry["name"]
-            entry.setdefault("key", slug(entry["name"]))
+            entry["key"] = self.unique_key(entry, entries)
             text += toml_block(entry, note)
             entries.append(entry)
             by_id[did] = entry
             changed = True
             log(f"discovered {sku} {did} at {ip} -> {'bridged' if entry['enabled'] else 'recorded (no profile)'}")
-        if LEGACY_IP and LEGACY_KEY and not any(e.get("ip") == LEGACY_IP for e in entries):
-            entry = {"ip": LEGACY_IP, "sku": "H60B0", "key": LEGACY_KEY, "name": LEGACY_NAME or LEGACY_KEY, "enabled": True}
-            text += toml_block(entry, "from v1 LAMP_IP/DEVICE_ID settings")
-            entries.append(entry)
-            changed = True
         if changed:
             self.write(text)
         return entries
+
+    @staticmethod
+    def unique_key(entry, entries):
+        """Entity ID prefix: the Govee room plus the device name if a room is set, else the device name;
+        suffixed if another light already uses it."""
+        base = slug(f"{entry['room']} {entry['name']}" if entry.get("room") else entry["name"])
+        taken = {e.get("key") for e in entries}
+        key, n = base, 2
+        while key in taken:
+            key, n = f"{base}_{n}", n + 1
+        return key
 
     @staticmethod
     def replace_ip(text, did, ip):
@@ -404,15 +403,18 @@ class Device:
 
     model = "Govee light"
 
-    def __init__(self, key, name, ip, sku, mqtt):
-        self.key, self.name, self.sku, self.mqtt = key, name, sku, mqtt
+    def __init__(self, key, name, ip, sku, mqtt, room=""):
+        self.key, self.name, self.sku, self.mqtt, self.room = key, name, sku, mqtt, room
         self.base = f"{ROOT}/{key}"
         self.lamp = Lamp(ip)
         self.pending, self.plock, self.timer = {}, threading.Lock(), None
 
     def device_info(self):
-        return {"identifiers": [f"govee_lan_{self.key}"], "name": self.name,
+        info = {"identifiers": [f"govee_lan_{self.key}"], "name": self.name,
                 "manufacturer": "Govee", "model": f"{self.sku} (LAN bridge)"}
+        if self.room:
+            info["suggested_area"] = self.room
+        return info
 
     def light_config(self, entity, label, modes, unique=None):
         uid = unique or f"{self.key}_{entity}"
@@ -488,8 +490,8 @@ class Device:
 class SegmentDevice(Device):
     """Lights using the 33 05 15 family: whole lamp + N segments; segment off = black."""
 
-    def __init__(self, key, name, ip, sku, mqtt, segments):
-        super().__init__(key, name, ip, sku, mqtt)
+    def __init__(self, key, name, ip, sku, mqtt, segments, room=""):
+        super().__init__(key, name, ip, sku, mqtt, room)
         self.n = int(segments)
         self.width = (self.n + 7) // 8
         self.all = (1 << self.n) - 1
@@ -598,8 +600,8 @@ class SegmentDevice(Device):
 class SectionDevice(Device):
     """Govee H60B0 Uplighter: whole lamp, three sections (two on at once), 8 side segments, flow rate."""
 
-    def __init__(self, key, name, ip, sku, mqtt):
-        super().__init__(key, name, ip, sku, mqtt)
+    def __init__(self, key, name, ip, sku, mqtt, room=""):
+        super().__init__(key, name, ip, sku, mqtt, room)
         self.power = {"state": "ON", "brightness": 255}
         self.state = {
             "ripple": {"state": "OFF", "brightness": 255, "color_mode": "color_temp", "color_temp": 4000, "color": {"r": 255, "g": 200, "b": 150}},
@@ -796,8 +798,8 @@ def make_device(entry, mqtt):
     key = entry.get("key") or slug(entry.get("name") or entry.get("id") or entry["ip"])
     args = (key, entry.get("name") or key, entry["ip"], (entry.get("sku") or "").upper(), mqtt)
     if prof["family"] == "sections":
-        return SectionDevice(*args)
-    return SegmentDevice(*args, segments=prof["segments"])
+        return SectionDevice(*args, room=entry.get("room") or "")
+    return SegmentDevice(*args, segments=prof["segments"], room=entry.get("room") or "")
 
 
 # ---------------------------------------------------------------- bridge
@@ -877,5 +879,20 @@ class Bridge:
         log("ready")
 
 
+def drop_privileges(uid=65534, gid=65534):
+    """Started as root (e.g. in Docker): make the config folder writable, then run unprivileged.
+    Docker creates a missing bind-mount folder as root, so this keeps deployment hands-off."""
+    if not hasattr(os, "getuid") or os.getuid() != 0:
+        return
+    folder = os.path.dirname(CONFIG_PATH) or "."
+    os.makedirs(folder, exist_ok=True)
+    for path in [folder] + [os.path.join(folder, f) for f in os.listdir(folder)]:
+        os.chown(path, uid, gid)
+    os.setgroups([])
+    os.setgid(gid)
+    os.setuid(uid)
+
+
 if __name__ == "__main__":
+    drop_privileges()
     Bridge().run()

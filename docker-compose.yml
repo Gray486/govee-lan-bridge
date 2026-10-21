@@ -5,9 +5,8 @@ services:
     image: swilli23/govee-lan-bridge:2
     restart: unless-stopped
     network_mode: host            # reaches the MQTT broker, govee2mqtt and the lights on the LAN
-    user: "1000:1000"             # owner of the config folder below (`id -u` / `id -g`)
     volumes:
-      - /path/to/govee-lan-bridge:/config   # devices.toml is created and maintained here
+      - /path/to/govee-lan-bridge:/config   # created automatically; devices.toml is generated here
     environment:
       MQTT_HOST: 127.0.0.1                  # the broker Home Assistant uses
       GOVEE2MQTT_URL: http://127.0.0.1:8056 # govee2mqtt's web UI; lights are discovered from it
