@@ -99,3 +99,6 @@ two-section logic. It runs offline, and the GitHub Action runs it before publish
 On every push to `main`, the GitHub Action runs the tests and publishes `latest` (amd64 + arm64) to
 Docker Hub. Tags like `v1.2.0` also publish `1.2.0` and `1.2`. It needs the repository secrets
 `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a Docker Hub access token with write scope).
+
+## License
+MIT. See [LICENSE](LICENSE).
