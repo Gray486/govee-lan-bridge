@@ -55,7 +55,9 @@ class FakeMQTT:
 br = B.Bridge()
 br.lamp, br.mqtt = FakeLamp(), FakeMQTT()
 br.restoring = False
-cmd = lambda sec, **kw: br.handle(f"{B.BASE}/{sec}/set", json.dumps(kw).encode(), False)
+def cmd(sec, **kw):
+    br.handle(f"{B.BASE}/{sec}/set", json.dumps(kw).encode(), False)
+    br.timer.cancel(); br.flush()
 
 cmd("ripple", state="ON", color={"r": 255, "g": 0, "b": 0}, brightness=128)
 cmd("side", state="ON", color_temp=3000)
@@ -65,13 +67,31 @@ batch = br.lamp.sent[-1]
 assert batch[0].startswith("33 30 01 00"), f"ripple should be switched off first, got {batch}"
 assert br.state["ripple"]["state"] == "OFF" and br.state["lower"]["state"] == "ON"
 print("PASS  two-section limit: turning on lower switched ripple off in the same datagram")
+n = len(br.lamp.sent)
 cmd("lower", color={"r": 1, "g": 2, "b": 3})     # colour on lower is ignored, not sent
-assert br.lamp.sent[-1] == [], f"colour must never reach the lower light, got {br.lamp.sent[-1]}"
+assert not br.lamp.sent[n:] or br.lamp.sent[-1] == [], f"colour must never reach the lower light, got {br.lamp.sent[-1]}"
 print("PASS  colour commands to the lower light are dropped")
 cmd("side", state="OFF")
 assert br.lamp.sent[-1] == ["33 30 02 00 00 00"], br.lamp.sent[-1]
 print("PASS  off is a single section-off frame")
 br.handle(f"{B.BASE}/flow/set", b"75", False)
+br.timer.cancel(); br.flush()
 assert br.lamp.sent[-1][0].startswith("33 05 2c 01 03 4b")
 print("PASS  flow rate")
+
+# Scene race: side+lower on; a scene sends ripple ON, side ON, lower OFF in any order within the window.
+import itertools
+for order in itertools.permutations([("ripple", {"state": "ON", "color": {"r": 9, "g": 9, "b": 9}}),
+                                     ("side", {"state": "ON", "brightness": 100}),
+                                     ("lower", {"state": "OFF"})]):
+    br.state["ripple"]["state"], br.state["side"]["state"], br.state["lower"]["state"] = "OFF", "ON", "ON"
+    br.on_order = ["side", "lower"]
+    for name, c in order:
+        br.handle(f"{B.BASE}/{name}/set", json.dumps(c).encode(), False)
+    br.timer.cancel(); br.flush()
+    got = {n: br.state[n]["state"] for n in B.SECTIONS}
+    assert got == {"ripple": "ON", "side": "ON", "lower": "OFF"}, (order, got)
+    assert not any(f.startswith("33 30 02 00") for f in br.lamp.sent[-1]), "side must not be switched off"
+    assert len(br.lamp.sent[-1]) > 1
+print("PASS  scene race: every command order lands as defined, in one datagram")
 print("\nALL TESTS PASSED" if not fails else f"\n{fails} FRAME MISMATCHES")

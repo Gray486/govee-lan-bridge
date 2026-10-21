@@ -47,6 +47,9 @@ services:
 ## Behaviour
 - **The lamp allows two sections on at once.** Turning on a third switches off the section that's been
   on longest, and Home Assistant is updated to match.
+- **Scenes apply atomically.** Commands arriving within 150 ms (`BATCH_WINDOW`) are merged into one change:
+  turn-offs first, then turn-ons, then the two-section rule. A scene moving between section pairs lands
+  exactly as defined, whatever order Home Assistant sends the commands in.
 - **One packet per change.** Separate LAN packets sent back-to-back get dropped by the lamp, so every
   change (e.g. a scene setting colour and brightness) is sent as a single packet.
 - **Safety:** colour temperatures are clamped to 2700–6500 K, and the down light never receives colour

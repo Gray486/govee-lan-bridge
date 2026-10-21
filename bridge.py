@@ -36,6 +36,7 @@ DISCOVERY = os.environ.get("DISCOVERY_PREFIX", "homeassistant")
 
 MIN_K, MAX_K = 2700, 6500          # outside this range the lamp blacks out
 MIN_GAP = 0.05                     # seconds between UDP datagrams to the lamp
+BATCH_WINDOW = float(os.environ.get("BATCH_WINDOW", "0.15"))  # commands this close together form one change
 SECTIONS = {"ripple": 1, "side": 2, "lower": 3}
 
 
@@ -242,6 +243,9 @@ class Bridge:
         self.flow = 20
         self.on_order = []            # sections in the order they were turned on (lamp allows two)
         self.restoring = True
+        self.pending = {}             # commands waiting for the batch window to close
+        self.plock = threading.Lock()
+        self.timer = None
 
     # -- discovery --------------------------------------------------------
     def device(self):
@@ -274,7 +278,7 @@ class Bridge:
         self.mqtt.publish(f"{BASE}/{name}/state", out, retain=True)
 
     # -- commands ------------------------------------------------------------
-    def section_frames(self, name, cmd):
+    def section_frames(self, name, cmd, protect=()):
         """Frames for one section's command; updates self.state."""
         sec, s, frames = SECTIONS[name], self.state[name], []
         if cmd.get("state") == "OFF":
@@ -285,7 +289,7 @@ class Bridge:
         turning_on = s["state"] != "ON"
         s["state"] = "ON"
         if turning_on:
-            frames += self.make_room(name)
+            frames += self.make_room(name, protect)
             frames += [f_power(True), f_section(sec, True)]
         if name in self.on_order:
             self.on_order.remove(name)
@@ -307,9 +311,11 @@ class Bridge:
             frames.append(f_brightness(sec, pct(s["brightness"])))
         return frames
 
-    def make_room(self, name):
-        """The lamp allows two sections at once: switch off the longest-on other section."""
+    def make_room(self, name, protect=()):
+        """The lamp allows two sections at once: switch off the longest-on other section,
+        preferring sections that aren't being turned on in the same change."""
         on = [n for n in self.on_order if n != name and self.state[n]["state"] == "ON"]
+        on.sort(key=lambda n: n in protect)          # stable: unprotected (oldest first) go first
         frames = []
         while len(on) >= 2:
             victim = on.pop(0)
@@ -335,14 +341,41 @@ class Bridge:
         if parts[-1] != "set":
             return
         target = parts[-2]
-        if target == "flow":
-            self.flow = max(0, min(100, int(float(payload))))
-            self.lamp.send([f_flow(self.flow)])
+        if target not in SECTIONS and target != "flow":
+            return
+        value = max(0, min(100, int(float(payload)))) if target == "flow" else json.loads(payload)
+        # Collect commands arriving close together (e.g. a scene) and apply them as one change.
+        with self.plock:
+            if target in SECTIONS and target in self.pending:
+                self.pending[target].update(value)
+            else:
+                self.pending[target] = value
+            if self.timer is None:
+                self.timer = threading.Timer(BATCH_WINDOW, self.flush)
+                self.timer.start()
+
+    def flush(self):
+        """Apply all pending commands as one change: offs first, then ons, in one datagram."""
+        with self.plock:
+            pending, self.pending, self.timer = self.pending, {}, None
+        frames, touched = [], []
+        offs = [n for n in SECTIONS if n in pending and pending[n].get("state") == "OFF"]
+        ons = [n for n in SECTIONS if n in pending and n not in offs]
+        for name in offs + ons:
+            frames += self.section_frames(name, pending[name], protect=set(ons))
+            touched.append(name)
+        if "flow" in pending:
+            self.flow = pending["flow"]
+            frames.append(f_flow(self.flow))
+        unique = []
+        for f in frames:                                  # drop repeated frames (e.g. power on)
+            if f not in unique:
+                unique.append(f)
+        self.lamp.send(unique)                            # one datagram for the whole change
+        for name in touched:
+            self.publish_state(name)
+        if "flow" in pending:
             self.mqtt.publish(f"{BASE}/flow/state", str(self.flow), retain=True)
-        elif target in SECTIONS:
-            frames = self.section_frames(target, json.loads(payload))
-            self.lamp.send(frames)                       # one datagram for the whole change
-            self.publish_state(target)
 
     # -- main loop ----------------------------------------------------------------
     def run(self):
