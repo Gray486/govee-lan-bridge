@@ -164,10 +164,10 @@ the scene batching and the config file handling. It runs offline, and the GitHub
 runs it before publishing an image.
 
 ## Contributing
-Reports for other models are welcome, especially lights that use the same `33 05 15` segment commands.
-Useful details: the model (SKU), how many segments the Govee app shows, which end segment 1 is, and whether
-per-segment colour, temperature and brightness work. Open an issue or a pull request with a new profile
-and its tests.
+Have a Govee light that isn't supported yet? [Request support for it](../../issues/new?template=new_device.yml):
+the form asks for the details needed to add it (model, what the Govee app can control, and whether you can run
+a few short visual tests). Many lights share a command family, so a new model is often just a profile.
+Pull requests with a new profile and its tests are welcome too.
 
 ## Disclaimer
 Unofficial and not affiliated with or endorsed by Govee. It uses undocumented LAN commands, which a

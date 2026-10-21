@@ -1,0 +1,74 @@
+name: Request support for a light
+description: Help add a Govee light to the bridge (per-segment / per-section control over LAN)
+title: "Support request: <model, e.g. H6076>"
+labels: ["new device"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks! Most Govee lights use one of a few command families, so a new model is often just a profile
+        (segment count, mask size, numbering). The details below are usually enough to find out which one.
+  - type: input
+    id: model
+    attributes:
+      label: Model (SKU)
+      description: Shown in the Govee Home app (device settings) or in govee2mqtt, e.g. H6076.
+      placeholder: H6076
+    validations:
+      required: true
+  - type: input
+    id: product
+    attributes:
+      label: Product name
+      placeholder: e.g. RGBICW Floor Lamp Basic
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of light is it?
+      options:
+        - Strip / rope / bar with segments
+        - Separate pieces (cubes, panels, sconces, bulbs on a string)
+        - Lamp with separate zones (e.g. top / side / bottom)
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: app
+    attributes:
+      label: What the Govee app can control
+      description: |
+        How many segments or zones does the app show? Per segment/zone, can you set colour, colour temperature,
+        brightness, on/off? Anything else (e.g. a rotation or flow speed)?
+      placeholder: |
+        App shows 10 segments. Each segment: colour + brightness. No per-segment temperature.
+    validations:
+      required: true
+  - type: checkboxes
+    id: lan
+    attributes:
+      label: LAN
+      options:
+        - label: LAN Control is enabled for this light in the Govee Home app
+        - label: govee2mqtt (or another LAN tool) can turn it on/off and change its colour
+  - type: textarea
+    id: devices
+    attributes:
+      label: govee2mqtt device entry (optional)
+      description: |
+        If you run govee2mqtt, its entry for this light from `http://<govee2mqtt host>:8056/api/devices`.
+        Remove the `ip` and `id` values if you prefer; the model and name are what matter.
+      render: json
+  - type: checkboxes
+    id: testing
+    attributes:
+      label: Testing
+      description: |
+        Mapping a light takes a few short visual tests (a light flashes, then one segment at a time changes
+        colour while you note what you see). Nothing is changed permanently.
+      options:
+        - label: I can run a few short test scripts on my LAN and report what the light does
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Links to related issues, captures, or what you've already tried.
