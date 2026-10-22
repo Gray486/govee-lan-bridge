@@ -111,11 +111,13 @@ enabled = true
 ## Behaviour
 - **Scenes apply atomically.** Commands for a light arriving within 150 ms are merged into one change
   and sent in one packet, whatever order Home Assistant sends them in.
-- **Packet size.** The lights accepted 18 commands per packet in testing but dropped 24 **entirely**; the
-  bridge sends at most 12 per packet and splits larger changes 50 ms apart. Separate packets sent back-to-back also get
-  dropped, so commands are always bundled.
-- **Segments (`segments` profile).** The whole-lamp light repaints every segment; segment lights control
-  one each. A segment's "off" is **black**, which is a true off. Turning the last segment off switches the
+- **Packet size.** The lights accepted 18 `ptReal` commands per packet in testing but dropped 24 **entirely**;
+  the bridge sends at most 12 per packet and splits larger changes 50 ms apart. Separate `ptReal` packets sent
+  back-to-back also get dropped, so they are always bundled. (Standard commands aren't affected.)
+- **Segments (`segments` profile).** Whole-lamp power, brightness and colour use Govee's standard LAN
+  commands (documented, reflected in the light's own status, and never dropped when sent back-to-back);
+  `ptReal` is used only for per-segment changes, sent right after any standard commands in the same change.
+  The whole-lamp light repaints every segment; segment lights control one each. A segment's "off" is **black**, which is a true off. Turning the last segment off switches the
   lamp off; turning one on while the lamp is off powers it on with the saved pattern.
 - **H60B0.** Two sections can be on at once: turning on a third switches off the one that's been on
   longest. Side segments are diffuse, so a side segment's "off" is minimum brightness. Turning the last lit
@@ -134,7 +136,7 @@ Assistant, then rename the new ones to the old entity IDs if scenes or dashboard
 Commands are standard 20-byte Govee frames (data, zero padding, XOR checksum), sent base64-encoded in a
 LAN `ptReal` message to UDP port 4003. Several frames can go in one message's `command` array.
 
-**All lights**
+**All lights** (the bridge uses these for the H60B0; segment lights use the standard `turn` / `brightness` / `colorwc` commands instead)
 | Function | Frame data |
 |---|---|
 | Power on/off | `33 01 01` / `33 01 00` |

@@ -155,6 +155,12 @@ class Lamp:
         self.lock = threading.Lock()
         self.last = 0.0
 
+    def command(self, cmd, data):
+        """A standard (documented) LAN command. These are applied even when sent back-to-back."""
+        with self.lock:
+            self.sock.sendto(json.dumps({"msg": {"cmd": cmd, "data": data}}).encode(), (self.ip, LAMP_PORT))
+        log(f"-> {self.ip}: {cmd} {json.dumps(data)}")
+
     def send(self, frames):
         for i in range(0, len(frames), MAX_FRAMES):
             chunk = frames[i:i + MAX_FRAMES]
@@ -408,6 +414,7 @@ class Device:
         self.base = f"{ROOT}/{key}"
         self.lamp = Lamp(ip)
         self.pending, self.plock, self.timer = {}, threading.Lock(), None
+        self.commands = []            # standard LAN commands for the current change
 
     def device_info(self):
         info = {"identifiers": [f"govee_lan_{self.key}"], "name": self.name,
@@ -466,12 +473,15 @@ class Device:
     def flush(self):
         with self.plock:
             pending, self.pending, self.timer = self.pending, {}, None
+        self.commands = []
         frames = self.apply(pending)
         unique = []
         for f in frames:                                  # drop repeated frames (e.g. power on)
             if f not in unique:
                 unique.append(f)
-        self.lamp.send(unique)                            # one datagram for the whole change
+        for cmd, data in self.commands:                   # standard commands first (verified safe before ptReal)
+            self.lamp.command(cmd, data)
+        self.lamp.send(unique)                            # then one datagram for all ptReal frames
         self.publish_states()
 
     # -- MQTT dispatch ------------------------------------------------------------
@@ -488,7 +498,23 @@ class Device:
 
 
 class SegmentDevice(Device):
-    """Lights using the 33 05 15 family: whole lamp + N segments; segment off = black."""
+    """Lights using the 33 05 15 family: whole lamp + N segments; segment off = black.
+
+    Whole-lamp power, brightness and colour use the standard LAN commands (documented, reported by the
+    light's own status, and never dropped when sent back-to-back); ptReal is only used for segments."""
+
+    def power(self, on):
+        self.commands.append(("turn", {"value": 1 if on else 0}))
+
+    def master(self, p):
+        self.commands.append(("brightness", {"value": p}))
+
+    def whole_colour(self):
+        w = self.whole
+        if w["color_mode"] == "color_temp":
+            self.commands.append(("colorwc", {"color": {"r": 0, "g": 0, "b": 0}, "colorTemInKelvin": clamp_k(w["color_temp"])}))
+        else:
+            self.commands.append(("colorwc", {"color": dict(w["color"]), "colorTemInKelvin": 0}))
 
     def __init__(self, key, name, ip, sku, mqtt, segments, room=""):
         super().__init__(key, name, ip, sku, mqtt, room)
@@ -553,16 +579,17 @@ class SegmentDevice(Device):
         if cmd is not None:
             if cmd.get("state") == "OFF":
                 self.whole["state"] = "OFF"
-                return [f_power(False)]
+                self.power(False)
+                return []
             turning_on = self.whole["state"] != "ON"
             self.whole["state"] = "ON"
             if turning_on:
-                frames.append(f_power(True))
+                self.power(True)
             if "brightness" in cmd:
                 self.whole["brightness"] = int(cmd["brightness"])
-                frames.append(f_master(pct(self.whole["brightness"])))
+                self.master(pct(self.whole["brightness"]))
             elif turning_on:
-                frames.append(f_master(pct(self.whole["brightness"])))
+                self.master(pct(self.whole["brightness"]))
             colour = {k: v for k, v in cmd.items() if k in ("color", "color_temp")}
             if colour:                                    # whole-lamp colour repaints every segment
                 self.apply_colour(self.whole, colour)
@@ -570,12 +597,12 @@ class SegmentDevice(Device):
                     seg["on"] = True
                     seg["color_mode"], seg["color"], seg["color_temp"] = (
                         self.whole["color_mode"], dict(self.whole["color"]), self.whole["color_temp"])
-                frames += self.segment_frames(range(self.n))
+                self.whole_colour()
             elif turning_on and not seg_cmds:
                 if not any(seg["on"] for seg in self.segs):
                     for seg in self.segs:
                         seg["on"] = True
-                frames += self.segment_frames(range(self.n))
+                frames += self.segment_frames(range(self.n))   # restore the saved pattern
         if seg_cmds:
             for i, c in seg_cmds.items():
                 if not 0 <= i < self.n:
@@ -587,10 +614,12 @@ class SegmentDevice(Device):
                     self.apply_colour(self.segs[i], c)
             if not any(seg["on"] for seg in self.segs):   # last segment off: switch the lamp off
                 self.whole["state"] = "OFF"
-                return frames + [f_power(False)]
+                self.power(False)
+                return frames
             if self.whole["state"] != "ON":
                 self.whole["state"] = "ON"
-                frames += [f_power(True), f_master(pct(self.whole["brightness"]))]
+                self.power(True)
+                self.master(pct(self.whole["brightness"]))
                 frames += self.segment_frames(range(self.n))
             else:
                 frames += self.segment_frames(sorted(i for i in seg_cmds if 0 <= i < self.n))

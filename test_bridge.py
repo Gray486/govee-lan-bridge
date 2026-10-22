@@ -54,7 +54,10 @@ except ValueError:
 # ---------------------------------------------------------------- fakes
 class FakeLamp:
     def __init__(self):
-        self.sent, self.ip = [], "192.0.2.1"
+        self.sent, self.cmds, self.ip = [], [], "192.0.2.1"
+
+    def command(self, cmd, data):
+        self.cmds.append((cmd, data))
 
     def send(self, frames):
         self.sent.append([hexf(f) for f in frames])
@@ -127,9 +130,12 @@ check("H60B0 whole lamp on + master brightness", sent[0].startswith("33 01 01") 
 # ---------------------------------------------------------------- segment family (H6088 / H61E0)
 s = dev_of(B.SegmentDevice, segments=6)
 check("H6088: 7 entities (lamp + 6 cubes)", s.entities() == ["lamp"] + [f"segment_{i}" for i in range(1, 7)])
+s.lamp.cmds.clear()
 sent = cmd(s, "lamp", {"state": "ON", "color": {"r": 0, "g": 255, "b": 0}, "brightness": 255})
-check("H6088 whole colour repaints all cubes in one frame (mask 0x3f)",
-      sent[0].startswith("33 01 01") and any(f.startswith("33 05 15 01 00 ff 00 00 00 00 00 00 3f") for f in sent), sent)
+check("H6088 whole lamp uses standard commands only (turn, brightness, colorwc; no ptReal)",
+      [c for c, _ in s.lamp.cmds] == ["turn", "brightness", "colorwc"] and s.lamp.cmds[2][1]["color"] == {"r": 0, "g": 255, "b": 0}
+      and sent == [], (s.lamp.cmds, sent))
+check("H6088 whole colour updates every cube's state", all(c["color"] == {"r": 0, "g": 255, "b": 0} and c["on"] for c in s.segs))
 sent = cmd(s, "segment_3", {"state": "OFF"})
 check("H6088 cube off = black on that cube only", sent == [hexf(B.f_seg_rgb(0, 0, 0, 0x04, 1))], sent)
 sent = cmd(s, "segment_3", {"state": "ON"})
@@ -145,15 +151,24 @@ for i in range(1, 7):
     s.handle(f"segment_{i}", "set", b'{"state": "OFF"}', False, False)
 s.timer.cancel()
 s.flush()
-check("H6088 last cube off -> lamp off", s.whole["state"] == "OFF" and s.lamp.sent[-1][-1].startswith("33 01 00"), s.lamp.sent[-1])
+check("H6088 last cube off -> lamp off (standard turn)", s.whole["state"] == "OFF" and s.lamp.cmds[-1] == ("turn", {"value": 0}), s.lamp.cmds[-1:])
+s.lamp.cmds.clear()
 sent = cmd(s, "segment_2", {"state": "ON", "color_temp": 3000})
-check("H6088 cube on while lamp off -> power on + pattern", sent[0].startswith("33 01 01") and s.whole["state"] == "ON", sent)
+check("H6088 cube on while lamp off -> standard power on, then the ptReal pattern",
+      [c for c, _ in s.lamp.cmds] == ["turn", "brightness"] and s.whole["state"] == "ON" and any(f.startswith("33 05 15") for f in sent), (s.lamp.cmds, sent))
+s.lamp.cmds.clear()
+cmd(s, "lamp", {"color_temp": 9000})
+check("H6088 whole-lamp temperature via colorwc, clamped", s.lamp.cmds == [("colorwc", {"color": {"r": 0, "g": 0, "b": 0}, "colorTemInKelvin": 6500})], s.lamp.cmds)
+s.lamp.cmds.clear()
+cmd(s, "lamp", {"state": "OFF"})
+check("H6088 whole lamp off = one standard turn command", s.lamp.cmds == [("turn", {"value": 0})], s.lamp.cmds)
 
 w = dev_of(B.SegmentDevice, segments=15)
 check("H61E0: 16 entities, 2-byte mask", len(w.entities()) == 16 and w.width == 2 and w.all == 0x7FFF)
 sent = cmd(w, "segment_12", {"state": "ON", "color": {"r": 255, "g": 0, "b": 255}})
 check("H61E0 segment 12 uses the second mask byte", any(f.startswith("33 05 15 01 ff 00 ff 00 00 00 00 00 00 08") for f in sent), sent)
-check("H61E0 a full-strip change fits the packet limit", len(cmd(w, "lamp", {"color": {"r": 1, "g": 2, "b": 3}})) <= B.MAX_FRAMES)
+w.lamp.cmds.clear()
+check("H61E0 whole-strip colour is one standard colorwc, no ptReal", cmd(w, "lamp", {"color": {"r": 1, "g": 2, "b": 3}}) == [] and w.lamp.cmds[-1][0] == "colorwc")
 
 # ---------------------------------------------------------------- inventory / devices.toml
 tmp = tempfile.mkdtemp()
