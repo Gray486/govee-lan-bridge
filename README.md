@@ -1,5 +1,9 @@
 # govee-lan-bridge
 
+[![Docker Hub](https://img.shields.io/docker/v/swilli23/govee-lan-bridge?sort=semver&label=docker%20hub&logo=docker)](https://hub.docker.com/r/swilli23/govee-lan-bridge)
+[![Image size](https://img.shields.io/docker/image-size/swilli23/govee-lan-bridge/2?logo=docker)](https://hub.docker.com/r/swilli23/govee-lan-bridge)
+[![Tests and image](https://github.com/SamWiIIiams/govee-lan-bridge/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/SamWiIIiams/govee-lan-bridge/actions/workflows/docker-publish.yml)
+
 Per-section and per-segment control of Govee lights from Home Assistant, **LAN only**: no Govee cloud,
 no API key, no internet connection.
 
@@ -47,6 +51,10 @@ it's the opposite: cube 1 is the one farthest from the power input.
 - Docker with host networking on the same LAN as the lights
 
 ## Run
+Prebuilt images (amd64 and arm64) are on Docker Hub as
+[`swilli23/govee-lan-bridge`](https://hub.docker.com/r/swilli23/govee-lan-bridge); no build needed.
+Use the `2` tag to get v2 updates without future breaking changes.
+
 ```yaml
 services:
   govee-lan-bridge:
